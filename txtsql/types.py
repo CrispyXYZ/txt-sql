@@ -1,8 +1,8 @@
-from enum import Enum, unique
+from enum import unique, StrEnum
 
 
 @unique
-class Types(Enum):
-    NUMBER = 1
-    STRING = 2
-    BINARY = 3
+class Types(StrEnum):
+    NUMBER = 'NUMBER'
+    STRING = 'STRING'
+    BINARY = 'BINARY'
