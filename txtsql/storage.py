@@ -77,7 +77,7 @@ class Table:
 
         def_keys: list[str] = list(self.defs.keys())
         def_count: int = len(def_keys)
-        updated_values: list[str | None] = [values.get(col) if col in list(values.keys()) else None for col in def_keys]
+        updated_values: list[str | None] = [values.get(col) for col in def_keys] # get method returns None if not found
         logger.debug(f'Generated values: {updated_values}')
 
         if all(value is None for value in updated_values):
@@ -88,7 +88,7 @@ class Table:
         with open(self.filename, 'r', encoding='utf-8') as file:
             reader = csv.reader(file, delimiter='\t')
             for row in reader:
-                if where is None or where({def_keys[i]: row[i] for i in range(def_count)}):
+                if where is None or where(dict(zip(def_keys, row))):
                     new_row = [row[i] if updated_values[i] is None else updated_values[i] for i in range(def_count)]
                 else:
                     new_row = row
