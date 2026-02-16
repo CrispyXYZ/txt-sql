@@ -6,6 +6,7 @@ type StringValue = str
 type BinaryValue = bytes
 type DataValue = NumberValue | StringValue | BinaryValue
 
+
 @unique
 class Types(StrEnum):
     NUMBER = 'NUMBER'
