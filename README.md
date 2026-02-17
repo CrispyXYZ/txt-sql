@@ -1,6 +1,10 @@
 # TxtSql
 
-A DBMS using tab-separated-value file. Supports simple SQL statements. (WIP)
+A DBMS that uses tab-separated-value files and supports simple SQL statements. (WIP)
+
+## Requirements
+
+Python >= 3.12
 
 ## Usage
 
