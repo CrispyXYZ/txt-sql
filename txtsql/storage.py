@@ -4,13 +4,14 @@ import os
 from collections.abc import Callable
 from decimal import Decimal
 
-from txtsql.exceptions import TableAlreadyExistsError
-from txtsql.types import Types, DataValue
+from .exceptions import TableAlreadyExistsError
+from .types import Types, DataValue
 
 _log = logging.getLogger(__name__)
 metadata_filename = 'metadata.txt'
 
 type RowDict = dict[str, DataValue]
+
 
 def create_table(name: str, defs: dict[str, Types]) -> Table:
     """ Create Table and return it. """
@@ -53,6 +54,7 @@ def get_table(name: str) -> Table | None:
     except FileNotFoundError:
         _log.warning('metadata.txt file not found. Returning None.')
         return None
+
 
 def drop_table(name: str) -> None:
     """ Drop table. Also erase metadata. """
@@ -253,7 +255,7 @@ class Table:
                     # Get key or insert [] then append
                     groups.setdefault(key, []).append(row)
             else:
-                groups = {(): rows} # treat entire set as one group
+                groups = {(): rows}  # treat entire set as one group
 
             # Calculate aggregations on each group
             result_rows: list[RowDict] = []
@@ -288,7 +290,7 @@ class Table:
                 seen = set()
                 unique_rows = []
                 for r in rows:
-                    key = tuple(sorted(r.items())) # to ensure the order of elements is the same
+                    key = tuple(sorted(r.items()))  # to ensure the order of elements is the same
                     if key not in seen:
                         seen.add(key)
                         unique_rows.append(r)

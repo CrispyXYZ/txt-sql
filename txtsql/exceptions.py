@@ -4,3 +4,11 @@ class TxtSqlError(Exception):
 
 class TableAlreadyExistsError(TxtSqlError):
     pass
+
+
+class SqlSyntaxError(TxtSqlError):
+    pass
+
+
+class EngineError(TxtSqlError):
+    pass
