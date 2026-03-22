@@ -1,3 +1,4 @@
+import base64
 import csv
 import logging
 import os
@@ -78,7 +79,7 @@ def _string_to_number(string: str) -> Decimal:
 
 
 def _string_to_binary(string: str) -> bytes:
-    return bytes.fromhex(string)
+    return base64.b64decode(string)
 
 
 def _number_to_string(number: Decimal) -> str:
@@ -86,7 +87,7 @@ def _number_to_string(number: Decimal) -> str:
 
 
 def _binary_to_string(binary: bytes) -> str:
-    return binary.hex()
+    return base64.b64encode(binary).decode()
 
 
 def _data_to_string(value: DataValue, type_def: Types) -> str | None:

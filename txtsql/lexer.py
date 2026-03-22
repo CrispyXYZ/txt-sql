@@ -10,13 +10,20 @@ class TokenType(StrEnum):
     CREATE = 'CREATE'
     DROP = 'DROP'
     TABLE = 'TABLE'
+    TYPE_STRING = 'STRING'
+    TYPE_NUMBER = 'NUMBER'
+    TYPE_BINARY = 'BINARY'
 
     SEMICOLON = 'SEMICOLON'
+    COMMA = 'COMMA'
+    RPAREN = 'RPAREN'
+    LPAREN = 'LPAREN'
 
     EOF = 'EOF'
 
     STRING = 'STRING'
     NUMBER = 'NUMBER'
+    BINARY = 'BINARY'
     IDENTIFIER = 'IDENTIFIER'
 
 
@@ -48,28 +55,52 @@ class Lexer:
             self.column += 1
         self.pos += 1
 
+    def peek(self) -> str | None:
+        pos = self.pos + 1
+        if pos < len(self.text):
+            return self.text[pos]
+        return None
+
     def skip_whitespace(self) -> None:
         while self.current_char() is not None and self.current_char().isspace():
             self.advance()
 
     def read_number(self) -> Token:
+        start_col = self.column
         num_str = ''
         while self.current_char() is not None and self.current_char().isdigit():
             num_str += self.current_char()
             self.advance()
-        return Token(TokenType.NUMBER, Decimal(num_str), self.line, self.column)
+        return Token(TokenType.NUMBER, Decimal(num_str), self.line, start_col)
 
     def read_string(self) -> Token:
+        start_col = self.column
         self.advance()  # to skip quote
         string_str = ''
         while self.current_char() is not None and self.current_char() != "'":
             string_str += self.current_char()
             self.advance()
-        if self.current_char() == '"':
+        if self.current_char() == "'":
             self.advance()
-        return Token(TokenType.STRING, string_str, self.line, self.column)
+        return Token(TokenType.STRING, string_str, self.line, start_col)
+
+    def read_binary(self) -> Token:
+        start_col = self.column
+
+        self.advance()
+        self.advance()
+
+        hex_chars = ''
+        while self.current_char() is not None and self.current_char() in '0123456789abcdefABCDEF':
+            hex_chars += self.current_char()
+            self.advance()
+
+        data = bytes.fromhex(hex_chars)
+
+        return Token(TokenType.BINARY, data, self.line, start_col)
 
     def read_identifier_or_keyword(self) -> Token:
+        start_col = self.column
         identifier = ''
         token_type = TokenType.IDENTIFIER
         while self.current_char() is not None and (self.current_char().isalnum() or self.current_char() == '_'):
@@ -82,9 +113,17 @@ class Lexer:
                 token_type = TokenType.DROP
             case 'TABLE':
                 token_type = TokenType.TABLE
+            case 'STRING' | 'VARCHAR':
+                token_type = TokenType.STRING
+                identifier = 'STRING'
+            case 'NUMBER' | 'DECIMAL':
+                token_type = TokenType.NUMBER
+                identifier = 'NUMBER'
+            case 'BINARY':
+                token_type = TokenType.BINARY
             case _:
                 token_type = TokenType.IDENTIFIER
-        return Token(token_type, identifier, self.line, self.column)
+        return Token(token_type, identifier, self.line, start_col)
 
     def get_next_token(self) -> Token:
         self.skip_whitespace()
@@ -96,9 +135,21 @@ class Lexer:
             case ';':
                 self.advance()
                 return Token(TokenType.SEMICOLON, ';', self.line, self.column - 1)
+            case ',':
+                self.advance()
+                return Token(TokenType.COMMA, ',', self.line, self.column - 1)
+            case '(':
+                self.advance()
+                return Token(TokenType.LPAREN, '(', self.line, self.column - 1)
+            case ')':
+                self.advance()
+                return Token(TokenType.RPAREN, ')', self.line, self.column - 1)
             case _:
                 if ch.isdigit():
-                    return self.read_number()
+                    if ch == '0' and self.peek() in ('x', 'X'):
+                        return self.read_binary()
+                    else:
+                        return self.read_number()
                 if ch == "'":
                     return self.read_string()
                 if ch.isalpha() or ch == '_':

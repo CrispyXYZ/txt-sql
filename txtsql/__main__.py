@@ -28,8 +28,8 @@ def main() -> None:
     print('========== END STORAGE TEST ==========')
 
     print('========== BEGIN SQL ENGINE TEST ==========')
-    storage.create_table("test_drop", {})
-    engine.execute_sql('DROP TABLE test_drop;')
+    engine.execute_sql('CREATE TABLE test ( name VARCHAR, age DECIMAL );')
+    engine.execute_sql('DROP TABLE test;')
     print('========== END SQL ENGINE TEST ==========')
 
 
