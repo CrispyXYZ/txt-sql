@@ -1,9 +1,9 @@
 from typing import Any
 
 from .exceptions import EngineError
-from .executor import execute_drop, execute_create
+from .executor import execute_drop, execute_create, execute_insert
 from .lexer import Lexer
-from .parser import Parser, DropTable, CreateTable
+from .parser import Parser, DropTable, CreateTable, InsertValues
 
 
 def execute_sql(sql: str) -> Any:
@@ -18,6 +18,9 @@ def execute_sql(sql: str) -> Any:
             return None
         case DropTable():
             execute_drop(statement)
+            return None
+        case InsertValues():
+            execute_insert(statement)
             return None
         case _:
             raise EngineError(f'Unsupported statement type: {type(statement)}')

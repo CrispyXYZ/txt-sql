@@ -16,6 +16,13 @@ class CreateTable:
     columns: list[tuple[str, str]]
 
 
+@dataclass(slots=True, frozen=True)
+class InsertValues:
+    table_name: str
+    columns: list[str] | None
+    values: list[list[Any]]
+
+
 class Parser:
     def __init__(self, tokens: list[Token]) -> None:
         self.tokens = tokens
@@ -46,6 +53,8 @@ class Parser:
                 return self.create_table()
             case TokenType.DROP:
                 return self.drop_table()
+            case TokenType.INSERT:
+                return self.insert_values()
             case _:
                 raise SqlSyntaxError(f'Unexpected statement: {token.type}')
 
@@ -79,6 +88,57 @@ class Parser:
     def _parse_type(self) -> Token:
         token = self.current_token()
         if token.type not in (TokenType.TYPE_STRING, TokenType.TYPE_NUMBER, TokenType.TYPE_BINARY):
-            raise SyntaxError(f"Expected type STRING, NUMBER or BINARY, but got {token.type}")
+            raise SqlSyntaxError(f'Expected type STRING, NUMBER or BINARY, but got {token.type}')
         self.pos += 1
         return token
+
+    def insert_values(self) -> InsertValues:
+        self.eat(TokenType.INSERT)
+        self.eat(TokenType.INTO)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+
+        # Optional column list
+        columns = None
+        if self.peek() == TokenType.LPAREN:
+            self.eat(TokenType.LPAREN)
+            columns = []
+            col_name = self.eat(TokenType.IDENTIFIER).value
+            columns.append(col_name)
+            while self.peek() == TokenType.COMMA:
+                self.eat(TokenType.COMMA)
+                col_name = self.eat(TokenType.IDENTIFIER).value
+                columns.append(col_name)
+            self.eat(TokenType.RPAREN)
+
+        self.eat(TokenType.VALUES)
+
+        # Parse multiple VALUES clauses
+        all_values = []
+        while True:
+            self.eat(TokenType.LPAREN)
+            values = []
+            first_value = self.current_token()
+            if first_value.type not in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
+                raise SqlSyntaxError(f'Expected value but got {first_value.type}')
+            values.append(first_value.value)
+            self.pos += 1
+
+            while self.peek() == TokenType.COMMA:
+                self.eat(TokenType.COMMA)
+                value_token = self.current_token()
+                if value_token.type not in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
+                    raise SqlSyntaxError(f'Expected value but got {value_token.type}')
+                values.append(value_token.value)
+                self.pos += 1
+
+            self.eat(TokenType.RPAREN)
+            all_values.append(values)
+
+            # Check if there are more VALUES clauses
+            if self.peek() != TokenType.COMMA:
+                break
+            self.eat(TokenType.COMMA)
+
+        if self.peek() == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+        return InsertValues(table_name, columns, all_values)

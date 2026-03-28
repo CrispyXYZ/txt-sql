@@ -28,7 +28,16 @@ def main() -> None:
     print('========== END STORAGE TEST ==========')
 
     print('========== BEGIN SQL ENGINE TEST ==========')
-    engine.execute_sql('CREATE TABLE test ( name VARCHAR, age DECIMAL );')
+    # Drop table if it already exists
+    try:
+        engine.execute_sql('CREATE TABLE test ( name VARCHAR, age DECIMAL );')
+    except Exception:
+        engine.execute_sql('DROP TABLE test;')
+        engine.execute_sql('CREATE TABLE test ( name VARCHAR, age DECIMAL );')
+
+    engine.execute_sql("INSERT INTO test VALUES ('Alice', 25);")
+    engine.execute_sql("INSERT INTO test (age, name) VALUES (30, 'Bob');")
+    engine.execute_sql("INSERT INTO test (name) VALUES ('Charlie'), ('David');")
     engine.execute_sql('DROP TABLE test;')
     print('========== END SQL ENGINE TEST ==========')
 

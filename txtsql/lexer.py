@@ -10,6 +10,9 @@ class TokenType(StrEnum):
     CREATE = 'CREATE'
     DROP = 'DROP'
     TABLE = 'TABLE'
+    INSERT = 'INSERT'
+    INTO = 'INTO'
+    VALUES = 'VALUES'
     TYPE_STRING = 'STRING'
     TYPE_NUMBER = 'NUMBER'
     TYPE_BINARY = 'BINARY'
@@ -113,6 +116,12 @@ class Lexer:
                 token_type = TokenType.DROP
             case 'TABLE':
                 token_type = TokenType.TABLE
+            case 'INSERT':
+                token_type = TokenType.INSERT
+            case 'INTO':
+                token_type = TokenType.INTO
+            case 'VALUES':
+                token_type = TokenType.VALUES
             case 'STRING' | 'VARCHAR':
                 token_type = TokenType.STRING
                 identifier = 'STRING'
