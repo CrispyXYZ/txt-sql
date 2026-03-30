@@ -38,7 +38,80 @@ def main() -> None:
     engine.execute_sql("INSERT INTO test VALUES ('Alice', 25);")
     engine.execute_sql("INSERT INTO test (age, name) VALUES (30, 'Bob');")
     engine.execute_sql("INSERT INTO test (name) VALUES ('Charlie'), ('David');")
+
+    print('========== BEGIN DELETE TEST ==========')
+    # 重新创建测试表用于 DELETE 测试
     engine.execute_sql('DROP TABLE test;')
+    engine.execute_sql('CREATE TABLE test ( name VARCHAR, age DECIMAL );')
+
+    # 插入测试数据
+    engine.execute_sql("INSERT INTO test VALUES ('Alice', 25);")
+    engine.execute_sql("INSERT INTO test VALUES ('Bob', 30);")
+    engine.execute_sql("INSERT INTO test VALUES ('Charlie', 35);")
+    engine.execute_sql("INSERT INTO test VALUES ('David', 20);")
+
+    # ===== 测试 1: DELETE FROM ... WHERE ... ====
+    print("Test 1: DELETE FROM test WHERE age > 25")
+    deleted = engine.execute_sql("DELETE FROM test WHERE age > 25")
+    print(f"Deleted rows: {deleted}")  # 应该删除 Bob(30) 和 Charlie(35) = 2 行
+
+    # 验证删除结果
+    result = engine.execute_sql("SELECT * FROM test")
+    print("Remaining records:", result)
+    assert len(result) == 2
+    names = {row['name'] for row in result}
+    assert names == {'Alice', 'David'}
+
+    # ===== 测试 2: DELETE FROM ... WHERE ... AND ... ====
+    print("\nTest 2: DELETE FROM test WHERE age >= 20 AND age <= 25")
+    deleted = engine.execute_sql("DELETE FROM test WHERE age >= 20 AND age <= 25")
+    print(f"Deleted rows: {deleted}")  # 应该删除 Alice(25) 和 David(20) = 2 行
+
+    result = engine.execute_sql("SELECT * FROM test")
+    print("Remaining records:", result)
+    assert len(result) == 0
+
+    # ===== 测试 3: DELETE FROM ... WHERE ... OR ... ====
+    print("\nTest 3: DELETE FROM test (重新插入数据)")
+    engine.execute_sql("INSERT INTO test VALUES ('Eve', 18);")
+    engine.execute_sql("INSERT INTO test VALUES ('Frank', 22);")
+    engine.execute_sql("INSERT INTO test VALUES ('Grace', 40);")
+
+    deleted = engine.execute_sql("DELETE FROM test WHERE age < 20 OR age > 30")
+    print(f"Deleted rows: {deleted}")  # 应该删除 Eve(18) 和 Grace(40) = 2 行
+
+    result = engine.execute_sql("SELECT * FROM test")
+    print("Remaining records:", result)
+    assert len(result) == 1
+    assert result[0]['name'] == 'Frank'
+
+    # ===== 测试 4: DELETE FROM ... (不带 WHERE) ====
+    print("\nTest 4: DELETE FROM test (删除所有)")
+    deleted = engine.execute_sql("DELETE FROM test")
+    print(f"Deleted rows: {deleted}")  # 应该删除所有行
+
+    result = engine.execute_sql("SELECT * FROM test")
+    print("Remaining records:", result)
+    assert len(result) == 0
+
+    # ===== 测试 5: WHERE 使用 NULL 判断 ====
+    print("\nTest 5: Testing NULL handling")
+    # 重新创建表并插入包含 NULL 的数据
+    engine.execute_sql('DROP TABLE test;')
+    engine.execute_sql('CREATE TABLE test ( name VARCHAR, optional_field VARCHAR );')
+    engine.execute_sql("INSERT INTO test VALUES ('Item1', 'value');")
+    engine.execute_sql("INSERT INTO test VALUES ('Item2', NULL);")
+
+    deleted = engine.execute_sql("DELETE FROM test WHERE optional_field IS NULL")
+    print(f"Deleted rows with NULL: {deleted}")  # 应该删除 1 行
+
+    result = engine.execute_sql("SELECT * FROM test")
+    print("Remaining records:", result)
+    assert len(result) == 1
+    assert result[0]['name'] == 'Item1'
+
+    engine.execute_sql('DROP TABLE test;')
+    print('========== END DELETE TEST ==========')
     print('========== END SQL ENGINE TEST ==========')
 
 

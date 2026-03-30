@@ -17,6 +17,23 @@ class TokenType(StrEnum):
     TYPE_NUMBER = 'NUMBER'
     TYPE_BINARY = 'BINARY'
 
+    DELETE = 'DELETE'
+    FROM = 'FROM'
+    WHERE = 'WHERE'
+    AND = 'AND'
+    OR = 'OR'
+    IS = 'IS'
+    TRUE = 'TRUE'
+    FALSE = 'FALSE'
+    NULL = 'NULL'
+
+    EQ = '='
+    NE = '<>'
+    GT = '>'
+    LT = '<'
+    GE = '>='
+    LE = '<='
+
     SEMICOLON = 'SEMICOLON'
     COMMA = 'COMMA'
     RPAREN = 'RPAREN'
@@ -122,6 +139,24 @@ class Lexer:
                 token_type = TokenType.INTO
             case 'VALUES':
                 token_type = TokenType.VALUES
+            case 'DELETE':
+                token_type = TokenType.DELETE
+            case 'FROM':
+                token_type = TokenType.FROM
+            case 'WHERE':
+                token_type = TokenType.WHERE
+            case 'AND':
+                token_type = TokenType.AND
+            case 'OR':
+                token_type = TokenType.OR
+            case 'IS':
+                token_type = TokenType.IS
+            case 'TRUE':
+                token_type = TokenType.TRUE
+            case 'FALSE':
+                token_type = TokenType.FALSE
+            case 'NULL':
+                token_type = TokenType.NULL
             case 'STRING' | 'VARCHAR':
                 token_type = TokenType.STRING
                 identifier = 'STRING'
@@ -153,6 +188,31 @@ class Lexer:
             case ')':
                 self.advance()
                 return Token(TokenType.RPAREN, ')', self.line, self.column - 1)
+            case '=':
+                self.advance()
+                return Token(TokenType.EQ, '=', self.line, self.column - 1)
+            case '<':
+                next_char = self.peek()
+                if next_char == '>':  # <>
+                    self.advance()
+                    self.advance()
+                    return Token(TokenType.NE, '<>', self.line, self.column - 2)
+                elif next_char == '=':  # <=
+                    self.advance()
+                    self.advance()
+                    return Token(TokenType.LE, '<=', self.line, self.column - 2)
+                else:  # <
+                    self.advance()
+                    return Token(TokenType.LT, '<', self.line, self.column - 1)
+            case '>':
+                next_char = self.peek()
+                if next_char == '=':  # >=
+                    self.advance()
+                    self.advance()
+                    return Token(TokenType.GE, '>=', self.line, self.column - 2)
+                else:  # >
+                    self.advance()
+                    return Token(TokenType.GT, '>', self.line, self.column - 1)
             case _:
                 if ch.isdigit():
                     if ch == '0' and self.peek() in ('x', 'X'):

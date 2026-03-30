@@ -311,3 +311,11 @@ class Table:
             result_rows = result_rows[:limit]
 
         return result_rows
+
+    def count_rows(self) -> int:
+        """统计表的记录行数"""
+        try:
+            with open(self.filename, 'r', encoding='utf-8') as f:
+                return sum(1 for _ in f)
+        except FileNotFoundError:
+            return 0
