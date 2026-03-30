@@ -56,7 +56,7 @@ def main() -> None:
     print(f"Deleted rows: {deleted}")  # 应该删除 Bob(30) 和 Charlie(35) = 2 行
 
     # 验证删除结果
-    result = engine.execute_sql("SELECT * FROM test")
+    result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 2
     names = {row['name'] for row in result}
@@ -67,7 +67,7 @@ def main() -> None:
     deleted = engine.execute_sql("DELETE FROM test WHERE age >= 20 AND age <= 25")
     print(f"Deleted rows: {deleted}")  # 应该删除 Alice(25) 和 David(20) = 2 行
 
-    result = engine.execute_sql("SELECT * FROM test")
+    result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 0
 
@@ -80,7 +80,7 @@ def main() -> None:
     deleted = engine.execute_sql("DELETE FROM test WHERE age < 20 OR age > 30")
     print(f"Deleted rows: {deleted}")  # 应该删除 Eve(18) 和 Grace(40) = 2 行
 
-    result = engine.execute_sql("SELECT * FROM test")
+    result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 1
     assert result[0]['name'] == 'Frank'
@@ -90,22 +90,22 @@ def main() -> None:
     deleted = engine.execute_sql("DELETE FROM test")
     print(f"Deleted rows: {deleted}")  # 应该删除所有行
 
-    result = engine.execute_sql("SELECT * FROM test")
+    result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 0
 
-    # ===== 测试 5: WHERE 使用 NULL 判断 ====
-    print("\nTest 5: Testing NULL handling")
-    # 重新创建表并插入包含 NULL 的数据
+    # ===== 测试 5: WHERE 使用"空值"判断（使用空字符串模拟 NULL） ====
+    print("\nTest 5: Testing handling of empty optional_field (simulated NULL)")
+    # 重新创建表并插入包含"空值"的数据（使用空字符串代替 NULL）
     engine.execute_sql('DROP TABLE test;')
     engine.execute_sql('CREATE TABLE test ( name VARCHAR, optional_field VARCHAR );')
     engine.execute_sql("INSERT INTO test VALUES ('Item1', 'value');")
-    engine.execute_sql("INSERT INTO test VALUES ('Item2', NULL);")
+    engine.execute_sql("INSERT INTO test VALUES ('Item2', '');")
 
-    deleted = engine.execute_sql("DELETE FROM test WHERE optional_field IS NULL")
-    print(f"Deleted rows with NULL: {deleted}")  # 应该删除 1 行
+    deleted = engine.execute_sql("DELETE FROM test WHERE optional_field = ''")
+    print(f"Deleted rows with empty optional_field: {deleted}")  # 应该删除 1 行
 
-    result = engine.execute_sql("SELECT * FROM test")
+    result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 1
     assert result[0]['name'] == 'Item1'

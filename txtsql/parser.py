@@ -140,11 +140,11 @@ class Parser:
         while self.current_token().type == TokenType.COMMA:
             self.eat(TokenType.COMMA)
             col_name = self.eat(TokenType.IDENTIFIER).value
-            col_type = self._parse_type().type
+            col_type = self._parse_type().value
             columns.append((col_name, col_type))
         self.eat(TokenType.RPAREN)
-        # 检查下一个 token 是否是 SEMICOLON
-        if self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1].type == TokenType.SEMICOLON:
+        # 检查当前 token 是否是 SEMICOLON
+        if self.current_token().type == TokenType.SEMICOLON:
             self.eat(TokenType.SEMICOLON)
         return CreateTable(table_name, columns)
 

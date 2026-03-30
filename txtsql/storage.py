@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import csv
 import logging
@@ -183,24 +185,28 @@ class Table:
             writer = csv.writer(file, delimiter='\t')
             writer.writerows(table_values)
 
-    def delete(self, where: Callable[[RowDict], bool] | None = None) -> None:
+    def delete(self, where: Callable[[RowDict], bool] | None = None) -> int:
         """
         :param where: Function which takes a row dictionary as parameter, returns bool. None to truncate all. (reserve metadata)
+        :return: Number of deleted rows
         """
         _log.debug(f'Deleting values from {self.name}')
 
         # If no condition, truncate all
         if where is None:
+            deleted_count = self.count_rows()
             with open(self.filename, 'w', encoding='utf-8'):
-                return
+                return deleted_count
 
         table_values: list[list[str]] = []
+        deleted_count = 0
         with open(self.filename, 'r', encoding='utf-8') as file:
             reader = csv.reader(file, delimiter='\t')
             for row in reader:
                 # Check each row
                 if where({key: _string_to_data(val, typ) for val, (key, typ) in zip(row, self.defs.items())}):
                     _log.debug(f'Deleting value: {row}')
+                    deleted_count += 1
                 else:
                     table_values.append(row)
 
@@ -208,6 +214,8 @@ class Table:
         with open(self.filename, 'w', encoding='utf-8', newline='') as file:
             writer = csv.writer(file, delimiter='\t')
             writer.writerows(table_values)
+
+        return deleted_count
 
     def select(
             self,

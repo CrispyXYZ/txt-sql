@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -9,7 +10,7 @@ from .storage import RowDict
 from .types import Types
 
 
-def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> callable[[RowDict], bool]:
+def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Callable[[RowDict], bool]:
     """
     将表达式 AST 求值为布尔函数
     :param expression: 表达式 AST
@@ -17,7 +18,7 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> call
     :return: 函数(row_dict) -> bool
     """
 
-    def eval_expr(expr: Expression) -> callable[[RowDict], bool]:
+    def eval_expr(expr: Expression) -> Callable[[RowDict], bool]:
         """内部递归求值函数"""
         match expr:
             case LiteralExpression(value):
@@ -33,10 +34,12 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> call
                 return _column
 
             case NullCheckExpression(column_expr, is_null):
-                eval_col = eval_expr(column_expr)
+                col_name = column_expr.column_name
 
                 def _null_check(row: RowDict) -> bool:
-                    value = eval_col(row)
+                    if col_name not in row:
+                        raise ValueError(f'Column does not exist: {col_name}')
+                    value = row[col_name]
                     return (value is None) == is_null
                 return _null_check
 
@@ -78,8 +81,6 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> call
 
             case _:
                 raise ValueError(f"Unsupported expression type: {type(expr).__name__}")
-
-        return eval_expr(expression)
 
     return eval_expr(expression)
 

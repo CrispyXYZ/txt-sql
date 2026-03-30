@@ -22,10 +22,7 @@ def execute_delete(statement: DeleteStatement) -> int:
     if statement.where_clause is not None:
         where_func = evaluate_where(statement.where_clause.expression, table.defs)
 
-    pre_count = table.count_rows()
-    table.delete(where=where_func)
-    post_count = table.count_rows()
-    return pre_count - post_count
+    return table.delete(where=where_func)
 
 
 def execute_drop(statement: DropTable) -> None:
