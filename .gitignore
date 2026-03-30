@@ -1,2 +1,6 @@
 .idea/
 temp/
+__pycache__/
+*.pyc
+*.txt
+!README.md

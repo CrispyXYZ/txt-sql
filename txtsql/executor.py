@@ -1,7 +1,8 @@
 from decimal import Decimal
 
 from . import storage
-from .parser import DropTable, CreateTable, InsertValues
+from .evaluator import evaluate_where
+from .parser import DropTable, CreateTable, InsertValues, DeleteStatement
 from .types import Types
 
 _TYPE_MAP = {
@@ -9,6 +10,19 @@ _TYPE_MAP = {
     'NUMBER': Types.NUMBER,
     'BINARY': Types.BINARY,
 }
+
+
+def execute_delete(statement: DeleteStatement) -> int:
+    """执行 DELETE 语句"""
+    table = storage.get_table(statement.table_name)
+    if table is None:
+        raise ValueError(f'Table does not exist: {statement.table_name}')
+
+    where_func = None
+    if statement.where_clause is not None:
+        where_func = evaluate_where(statement.where_clause.expression, table.defs)
+
+    return table.delete(where=where_func)
 
 
 def execute_drop(statement: DropTable) -> None:
