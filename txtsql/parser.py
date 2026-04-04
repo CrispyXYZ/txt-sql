@@ -39,32 +39,32 @@ class ComparisonOp(Enum):
 
 
 class Expression:
-    """基类：表达式"""
+    """Base class: expression"""
     pass
 
 
 @dataclass
 class LiteralExpression(Expression):
-    """字面值表达式: 1, 'hello', NULL, TRUE, FALSE"""
+    """Literal expression: 1, 'hello', NULL, TRUE, FALSE"""
     value: Any
 
 
 @dataclass
 class ColumnExpression(Expression):
-    """列名表达式: age, name"""
+    """Column name expression: age, name"""
     column_name: str
 
 
 @dataclass
 class NullCheckExpression(Expression):
-    """NULL 检查: column IS [NOT] NULL"""
+    """NULL check: column IS [NOT] NULL"""
     column: ColumnExpression
     is_null: bool  # True for IS NULL, False for IS NOT NULL
 
 
 @dataclass
 class ConditionExpression(Expression):
-    """条件表达式: column op literal (e.g., age > 18)"""
+    """Condition expression: column op literal (e.g., age > 18)"""
     column: ColumnExpression
     op: ComparisonOp
     literal: LiteralExpression
@@ -72,7 +72,7 @@ class ConditionExpression(Expression):
 
 @dataclass
 class LogicalExpression(Expression):
-    """逻辑表达式: left AND/OR right"""
+    """Logical expression: left AND/OR right"""
     left: Expression
     op: LogicalOp
     right: Expression
@@ -80,7 +80,7 @@ class LogicalExpression(Expression):
 
 @dataclass
 class WhereClause:
-    """WHERE 子句包装器"""
+    """WHERE clause wrapper"""
     expression: Expression
 
 
@@ -136,14 +136,14 @@ class Parser:
         col_name = self.eat(TokenType.IDENTIFIER).value
         col_type = self._parse_type().value
         columns.append((col_name, col_type))
-        # 检查当前 token 是否是 COMMA
+        # Check if current token is COMMA
         while self.current_token().type == TokenType.COMMA:
             self.eat(TokenType.COMMA)
             col_name = self.eat(TokenType.IDENTIFIER).value
             col_type = self._parse_type().value
             columns.append((col_name, col_type))
         self.eat(TokenType.RPAREN)
-        # 检查当前 token 是否是 SEMICOLON
+        # Check if current token is SEMICOLON
         if self.current_token().type == TokenType.SEMICOLON:
             self.eat(TokenType.SEMICOLON)
         return CreateTable(table_name, columns)
@@ -152,7 +152,7 @@ class Parser:
         self.eat(TokenType.DROP)
         self.eat(TokenType.TABLE)
         table_name = self.eat(TokenType.IDENTIFIER).value
-        # 检查当前 token 是否是 SEMICOLON
+        # Check if current token is SEMICOLON
         if self.current_token().type == TokenType.SEMICOLON:
             self.eat(TokenType.SEMICOLON)
         return DropTable(table_name)
@@ -217,11 +217,11 @@ class Parser:
 
     # Expression parsing methods
     def parse_expression(self) -> Expression:
-        """解析 expression (入口)"""
+        """Parse expression (entry point)"""
         return self.parse_or()
 
     def parse_or(self) -> Expression:
-        """解析 OR 表达式 (AND 优先于 OR)"""
+        """Parse OR expression (AND has higher precedence than OR)"""
         left = self.parse_and()
         while self.current_token().type == TokenType.OR:
             op = LogicalOp.OR
@@ -231,7 +231,7 @@ class Parser:
         return left
 
     def parse_and(self) -> Expression:
-        """解析 AND 表达式"""
+        """Parse AND expression"""
         left = self.parse_condition()
         while self.current_token().type == TokenType.AND:
             op = LogicalOp.AND
@@ -241,28 +241,28 @@ class Parser:
         return left
 
     def parse_condition(self) -> Expression:
-        """解析 condition (比较表达式或括号表达式)"""
+        """Parse condition (comparison expression or parenthesized expression)"""
         token = self.current_token()
 
-        # 括号表达式
+        # Parenthesized expression
         if token.type == TokenType.LPAREN:
             self.eat(TokenType.LPAREN)
             expr = self.parse_expression()
             self.eat(TokenType.RPAREN)
             return expr
 
-        # NULL 检查: column IS [NOT] NULL
+        # NULL check: column IS [NOT] NULL
         if token.type == TokenType.IDENTIFIER and self.peek() == TokenType.IS:
             return self._parse_null_check()
 
-        # 比较表达式: column_name = literal
+        # Comparison expression: column_name op literal
         if token.type == TokenType.IDENTIFIER and self._is_comparison_op(self.peek()):
             return self._parse_comparison()
 
         raise SqlSyntaxError(f"Unexpected token: {token.type} at line {token.line}, column {token.column}")
 
     def _parse_null_check(self) -> Expression:
-        """解析 column IS [NOT] NULL"""
+        """Parse column IS [NOT] NULL"""
         column = self.eat(TokenType.IDENTIFIER).value
         self.eat(TokenType.IS)
 
@@ -276,11 +276,11 @@ class Parser:
 
         return NullCheckExpression(
             ColumnExpression(column),
-            is_null=not is_not  # True 表示 IS NULL, False 表示 IS NOT NULL
+            is_null=not is_not  # True means IS NULL, False means IS NOT NULL
         )
 
     def _parse_comparison(self) -> Expression:
-        """解析 column_name op literal"""
+        """Parse column_name op literal"""
         column_token = self.eat(TokenType.IDENTIFIER)
         column_name = column_token.value
 
@@ -307,7 +307,7 @@ class Parser:
             case _:
                 raise SqlSyntaxError(f"Invalid comparison operator: {op_token.type}")
 
-        # 解析字面值
+        # Parse literal value
         literal_token = self.current_token()
         if literal_token.type in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
             self.pos += 1
@@ -331,28 +331,28 @@ class Parser:
         )
 
     def _is_comparison_op(self, token_type: TokenType) -> bool:
-        """判断是否是比较运算符"""
+        """Determine if token is a comparison operator"""
         return token_type in [
             TokenType.EQ, TokenType.NE, TokenType.GT, TokenType.LT,
             TokenType.GE, TokenType.LE
         ]
 
     def delete_statement(self) -> DeleteStatement:
-        """解析 DELETE FROM table_name WHERE condition;"""
+        """Parse DELETE FROM table_name WHERE condition;"""
         self.eat(TokenType.DELETE)
         self.eat(TokenType.FROM)
 
-        # 表名
+        # Table name
         table_name = self.eat(TokenType.IDENTIFIER).value
 
-        # WHERE 子句（可选）
+        # WHERE clause (optional)
         where_clause = None
         if self.current_token().type == TokenType.WHERE:
             self.eat(TokenType.WHERE)
             expression = self.parse_expression()
             where_clause = WhereClause(expression)
 
-        # 分号可选
+        # Semicolon optional
         if self.current_token().type == TokenType.SEMICOLON:
             self.eat(TokenType.SEMICOLON)
 

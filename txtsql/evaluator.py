@@ -12,14 +12,14 @@ from .types import Types
 
 def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Callable[[RowDict], bool]:
     """
-    将表达式 AST 求值为布尔函数
-    :param expression: 表达式 AST
-    :param table_defs: 表结构定义 {col_name: Types}
-    :return: 函数(row_dict) -> bool
+    Evaluate AST expression to bool function.
+    :param expression: AST expression
+    :param table_defs: Table defs {col_name: Types}
+    :return: Function (row_dict) -> bool
     """
 
     def eval_expr(expr: Expression) -> Callable[[RowDict], bool]:
-        """内部递归求值函数"""
+        """Internal recursive evaluation function"""
         match expr:
             case LiteralExpression(value):
                 def _literal(row: RowDict) -> bool:
@@ -86,7 +86,7 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Call
 
 
 def _to_bool(value: Any) -> bool:
-    """基础类型转布尔值"""
+    """Convert basic types to boolean values"""
     if value is None:
         return False
     if isinstance(value, bool):
@@ -99,7 +99,7 @@ def _to_bool(value: Any) -> bool:
 
 
 def _check_type_compatibility(value: Any, expected_type: Types) -> bool:
-    """检查字面值类型是否与列类型兼容"""
+    """Check if literal type is compatible with column type"""
     if value is None:
         return True
     match expected_type:
@@ -113,7 +113,7 @@ def _check_type_compatibility(value: Any, expected_type: Types) -> bool:
 
 
 def _compare(left: Any, right: Any, op: ComparisonOp) -> bool:
-    """执行比较运算，处理 NULL 和类型转换"""
+    """Execute comparison operations, handling NULL and type conversion"""
     if left is None or right is None:
         if op == ComparisonOp.EQ:
             return left is None and right is None

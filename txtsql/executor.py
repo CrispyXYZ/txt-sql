@@ -13,7 +13,7 @@ _TYPE_MAP = {
 
 
 def execute_delete(statement: DeleteStatement) -> int:
-    """执行 DELETE 语句"""
+    """Execute DELETE statement"""
     table = storage.get_table(statement.table_name)
     if table is None:
         raise ValueError(f'Table does not exist: {statement.table_name}')

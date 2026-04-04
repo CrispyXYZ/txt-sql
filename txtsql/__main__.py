@@ -40,70 +40,70 @@ def main() -> None:
     engine.execute_sql("INSERT INTO test (name) VALUES ('Charlie'), ('David');")
 
     print('========== BEGIN DELETE TEST ==========')
-    # 重新创建测试表用于 DELETE 测试
+    # Recreate test table for DELETE test
     engine.execute_sql('DROP TABLE test;')
     engine.execute_sql('CREATE TABLE test ( name VARCHAR, age DECIMAL );')
 
-    # 插入测试数据
+    # Insert test data
     engine.execute_sql("INSERT INTO test VALUES ('Alice', 25);")
     engine.execute_sql("INSERT INTO test VALUES ('Bob', 30);")
     engine.execute_sql("INSERT INTO test VALUES ('Charlie', 35);")
     engine.execute_sql("INSERT INTO test VALUES ('David', 20);")
 
-    # ===== 测试 1: DELETE FROM ... WHERE ... ====
+    # ===== Test 1: DELETE FROM ... WHERE ... ====
     print("Test 1: DELETE FROM test WHERE age > 25")
     deleted = engine.execute_sql("DELETE FROM test WHERE age > 25")
-    print(f"Deleted rows: {deleted}")  # 应该删除 Bob(30) 和 Charlie(35) = 2 行
+        print(f"Deleted rows: {deleted}")  # Should delete Bob(30) and Charlie(35) = 2 rows
 
-    # 验证删除结果
+    # Verify deletion result
     result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 2
     names = {row['name'] for row in result}
     assert names == {'Alice', 'David'}
 
-    # ===== 测试 2: DELETE FROM ... WHERE ... AND ... ====
+    # ===== Test 2: DELETE FROM ... WHERE ... AND ... ====
     print("\nTest 2: DELETE FROM test WHERE age >= 20 AND age <= 25")
     deleted = engine.execute_sql("DELETE FROM test WHERE age >= 20 AND age <= 25")
-    print(f"Deleted rows: {deleted}")  # 应该删除 Alice(25) 和 David(20) = 2 行
+    print(f"Deleted rows: {deleted}")  # Should delete Alice(25) and David(20) = 2 rows
 
     result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 0
 
-    # ===== 测试 3: DELETE FROM ... WHERE ... OR ... ====
-    print("\nTest 3: DELETE FROM test (重新插入数据)")
+    # ===== Test 3: DELETE FROM ... WHERE ... OR ... ====
+    print("\nTest 3: DELETE FROM test (re-insert data)")
     engine.execute_sql("INSERT INTO test VALUES ('Eve', 18);")
     engine.execute_sql("INSERT INTO test VALUES ('Frank', 22);")
     engine.execute_sql("INSERT INTO test VALUES ('Grace', 40);")
 
     deleted = engine.execute_sql("DELETE FROM test WHERE age < 20 OR age > 30")
-    print(f"Deleted rows: {deleted}")  # 应该删除 Eve(18) 和 Grace(40) = 2 行
+        print(f"Deleted rows: {deleted}")  # Should delete Eve(18) and Grace(40) = 2 rows
 
     result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 1
     assert result[0]['name'] == 'Frank'
 
-    # ===== 测试 4: DELETE FROM ... (不带 WHERE) ====
-    print("\nTest 4: DELETE FROM test (删除所有)")
+    # ===== Test 4: DELETE FROM ... (without WHERE) ====
+    print("\nTest 4: DELETE FROM test (delete all)")
     deleted = engine.execute_sql("DELETE FROM test")
-    print(f"Deleted rows: {deleted}")  # 应该删除所有行
+        print(f"Deleted rows: {deleted}")  # Should delete all rows
 
     result = storage.get_table('test').select()
     print("Remaining records:", result)
     assert len(result) == 0
 
-    # ===== 测试 5: WHERE 使用"空值"判断（使用空字符串模拟 NULL） ====
+    # ===== Test 5: WHERE using "empty value" check (using empty string to simulate NULL) ====
     print("\nTest 5: Testing handling of empty optional_field (simulated NULL)")
-    # 重新创建表并插入包含"空值"的数据（使用空字符串代替 NULL）
+    # Recreate table and insert data containing "empty values" (using empty string instead of NULL)
     engine.execute_sql('DROP TABLE test;')
     engine.execute_sql('CREATE TABLE test ( name VARCHAR, optional_field VARCHAR );')
     engine.execute_sql("INSERT INTO test VALUES ('Item1', 'value');")
     engine.execute_sql("INSERT INTO test VALUES ('Item2', '');")
 
     deleted = engine.execute_sql("DELETE FROM test WHERE optional_field = ''")
-    print(f"Deleted rows with empty optional_field: {deleted}")  # 应该删除 1 行
+        print(f"Deleted rows with empty optional_field: {deleted}")  # Should delete 1 row
 
     result = storage.get_table('test').select()
     print("Remaining records:", result)
