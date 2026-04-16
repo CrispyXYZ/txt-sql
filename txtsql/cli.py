@@ -1,6 +1,7 @@
+from typing import Any
 from .engine import execute_sql
 
-def print_table(rows):
+def print_table(rows: list[dict[str, Any]]) -> None:
     """Prints a list of dictionaries as a formatted ASCII table with borders."""
     if not rows:
         print("Empty set.")
