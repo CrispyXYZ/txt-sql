@@ -1,5 +1,3 @@
-from decimal import Decimal
-
 from . import storage
 from .evaluator import evaluate_where
 from .parser import DropTable, CreateTable, InsertValues, DeleteStatement, SelectStatement, UpdateStatement
@@ -65,18 +63,10 @@ def execute_insert(statement: InsertValues) -> None:
         for col, val in zip(target_columns, value_row):
             row_data[col] = val
 
-        # Add default values for unspecified columns
+        # Unspecified columns default to NULL
         for col in all_columns:
             if col not in row_data:
-                col_type = table.defs[col]
-                if col_type == 'STRING':
-                    row_data[col] = ''  # String defaults to empty string
-                elif col_type == 'NUMBER':
-                    row_data[col] = Decimal('0')  # Number defaults to 0
-                elif col_type == 'BINARY':
-                    row_data[col] = b''  # Binary defaults to empty bytes
-                else:
-                    row_data[col] = None
+                row_data[col] = None
 
         table.insert_values(row_data)
 
