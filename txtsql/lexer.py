@@ -17,11 +17,24 @@ class TokenType(StrEnum):
     TYPE_NUMBER = 'NUMBER'
     TYPE_BINARY = 'BINARY'
 
+    SELECT = 'SELECT'
+    DISTINCT = 'DISTINCT'
+    STAR = 'STAR'
+    UPDATE = 'UPDATE'
+    SET = 'SET'
+    ORDER = 'ORDER'
+    BY = 'BY'
+    ASC = 'ASC'
+    DESC = 'DESC'
+    LIMIT = 'LIMIT'
+    OFFSET = 'OFFSET'
+
     DELETE = 'DELETE'
     FROM = 'FROM'
     WHERE = 'WHERE'
     AND = 'AND'
     OR = 'OR'
+    NOT = 'NOT'
     IS = 'IS'
     TRUE = 'TRUE'
     FALSE = 'FALSE'
@@ -139,6 +152,26 @@ class Lexer:
                 token_type = TokenType.INTO
             case 'VALUES':
                 token_type = TokenType.VALUES
+            case 'SELECT':
+                token_type = TokenType.SELECT
+            case 'DISTINCT':
+                token_type = TokenType.DISTINCT
+            case 'UPDATE':
+                token_type = TokenType.UPDATE
+            case 'SET':
+                token_type = TokenType.SET
+            case 'ORDER':
+                token_type = TokenType.ORDER
+            case 'BY':
+                token_type = TokenType.BY
+            case 'ASC':
+                token_type = TokenType.ASC
+            case 'DESC':
+                token_type = TokenType.DESC
+            case 'LIMIT':
+                token_type = TokenType.LIMIT
+            case 'OFFSET':
+                token_type = TokenType.OFFSET
             case 'DELETE':
                 token_type = TokenType.DELETE
             case 'FROM':
@@ -149,6 +182,8 @@ class Lexer:
                 token_type = TokenType.AND
             case 'OR':
                 token_type = TokenType.OR
+            case 'NOT':
+                token_type = TokenType.NOT
             case 'IS':
                 token_type = TokenType.IS
             case 'TRUE':
@@ -188,6 +223,9 @@ class Lexer:
             case ')':
                 self.advance()
                 return Token(TokenType.RPAREN, ')', self.line, self.column - 1)
+            case '*':
+                self.advance()
+                return Token(TokenType.STAR, '*', self.line, self.column - 1)
             case '=':
                 self.advance()
                 return Token(TokenType.EQ, '=', self.line, self.column - 1)

@@ -2,7 +2,8 @@ from decimal import Decimal
 
 from . import storage
 from .evaluator import evaluate_where
-from .parser import DropTable, CreateTable, InsertValues, DeleteStatement
+from .parser import DropTable, CreateTable, InsertValues, DeleteStatement, SelectStatement, UpdateStatement
+from .storage import RowDict
 from .types import Types
 
 _TYPE_MAP = {
@@ -78,3 +79,47 @@ def execute_insert(statement: InsertValues) -> None:
                     row_data[col] = None
 
         table.insert_values(row_data)
+
+
+def execute_select(statement: SelectStatement) -> list[RowDict]:
+    """Execute SELECT statement"""
+    table = storage.get_table(statement.table_name)
+    if table is None:
+        raise ValueError(f'Table does not exist: {statement.table_name}')
+
+    where_func = None
+    if statement.where_clause is not None:
+        where_func = evaluate_where(statement.where_clause.expression, table.defs)
+
+    return table.select(
+        columns=statement.columns,
+        where=where_func,
+        order_by=statement.order_by,
+        distinct=statement.distinct,
+        limit=statement.limit,
+        offset=statement.offset,
+    )
+
+
+def execute_update(statement: UpdateStatement) -> int:
+    """Execute UPDATE statement, returns number of affected rows"""
+    table = storage.get_table(statement.table_name)
+    if table is None:
+        raise ValueError(f'Table does not exist: {statement.table_name}')
+
+    all_columns = list(table.defs.keys())
+    for col, _ in statement.set_clauses:
+        if col not in all_columns:
+            raise ValueError(f'Column does not exist: {col}')
+
+    where_func = None
+    if statement.where_clause is not None:
+        where_func = evaluate_where(statement.where_clause.expression, table.defs)
+
+    # Count affected rows before updating
+    affected = len(table.select(where=where_func))
+
+    values: RowDict = {col: val for col, val in statement.set_clauses}
+    table.update(values, where=where_func)
+
+    return affected

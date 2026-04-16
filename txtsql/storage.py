@@ -93,7 +93,9 @@ def _binary_to_string(binary: bytes) -> str:
 
 
 def _data_to_string(value: DataValue, type_def: Types) -> str | None:
-    """ Convert data type to string, usually for writing. """
+    """ Convert data type to string, usually for writing. Returns None if value is None (indicates no change). """
+    if value is None:
+        return None
     match type_def:
         case Types.NUMBER:
             return _number_to_string(Decimal(value))
