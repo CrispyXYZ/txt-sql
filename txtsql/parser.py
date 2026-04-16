@@ -90,6 +90,24 @@ class DeleteStatement:
     where_clause: WhereClause | None
 
 
+@dataclass(slots=True, frozen=True)
+class SelectStatement:
+    table_name: str
+    columns: list[str] | None  # None means SELECT *
+    distinct: bool
+    where_clause: WhereClause | None
+    order_by: list[tuple[str, bool]] | None  # (column, desc)
+    limit: int | None
+    offset: int
+
+
+@dataclass(slots=True, frozen=True)
+class UpdateStatement:
+    table_name: str
+    set_clauses: list[tuple[str, Any]]  # [(column, value), ...]
+    where_clause: WhereClause | None
+
+
 class Parser:
     def __init__(self, tokens: list[Token]) -> None:
         self.tokens = tokens
@@ -124,6 +142,10 @@ class Parser:
                 return self.insert_values()
             case TokenType.DELETE:
                 return self.delete_statement()
+            case TokenType.SELECT:
+                return self.select_statement()
+            case TokenType.UPDATE:
+                return self.update_statement()
             case _:
                 raise SqlSyntaxError(f'Unexpected statement: {token.type}')
 
@@ -357,3 +379,123 @@ class Parser:
             self.eat(TokenType.SEMICOLON)
 
         return DeleteStatement(table_name, where_clause)
+
+    def select_statement(self) -> SelectStatement:
+        """Parse SELECT [DISTINCT] col1, col2, * FROM table [WHERE expr] [ORDER BY col [ASC|DESC], ...] [LIMIT n] [OFFSET n];"""
+        self.eat(TokenType.SELECT)
+
+        # Optional DISTINCT
+        distinct = False
+        if self.current_token().type == TokenType.DISTINCT:
+            self.eat(TokenType.DISTINCT)
+            distinct = True
+
+        # Column list or *
+        columns: list[str] | None
+        if self.current_token().type == TokenType.STAR:
+            self.eat(TokenType.STAR)
+            columns = None
+        else:
+            columns = []
+            columns.append(self.eat(TokenType.IDENTIFIER).value)
+            while self.current_token().type == TokenType.COMMA:
+                self.eat(TokenType.COMMA)
+                columns.append(self.eat(TokenType.IDENTIFIER).value)
+
+        self.eat(TokenType.FROM)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+
+        # Optional WHERE
+        where_clause = None
+        if self.current_token().type == TokenType.WHERE:
+            self.eat(TokenType.WHERE)
+            where_clause = WhereClause(self.parse_expression())
+
+        # Optional ORDER BY
+        order_by: list[tuple[str, bool]] | None = None
+        if self.current_token().type == TokenType.ORDER:
+            self.eat(TokenType.ORDER)
+            self.eat(TokenType.BY)
+            order_by = []
+            col = self.eat(TokenType.IDENTIFIER).value
+            desc = False
+            if self.current_token().type == TokenType.DESC:
+                self.eat(TokenType.DESC)
+                desc = True
+            elif self.current_token().type == TokenType.ASC:
+                self.eat(TokenType.ASC)
+            order_by.append((col, desc))
+            while self.current_token().type == TokenType.COMMA:
+                self.eat(TokenType.COMMA)
+                col = self.eat(TokenType.IDENTIFIER).value
+                desc = False
+                if self.current_token().type == TokenType.DESC:
+                    self.eat(TokenType.DESC)
+                    desc = True
+                elif self.current_token().type == TokenType.ASC:
+                    self.eat(TokenType.ASC)
+                order_by.append((col, desc))
+
+        # Optional LIMIT
+        limit: int | None = None
+        if self.current_token().type == TokenType.LIMIT:
+            self.eat(TokenType.LIMIT)
+            limit = int(self.eat(TokenType.NUMBER).value)
+
+        # Optional OFFSET
+        offset = 0
+        if self.current_token().type == TokenType.OFFSET:
+            self.eat(TokenType.OFFSET)
+            offset = int(self.eat(TokenType.NUMBER).value)
+
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+
+        return SelectStatement(table_name, columns, distinct, where_clause, order_by, limit, offset)
+
+    def _parse_literal_value(self) -> Any:
+        """Parse a literal value token (STRING, NUMBER, BINARY, NULL, TRUE, FALSE)."""
+        val_token = self.current_token()
+        if val_token.type in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
+            self.pos += 1
+            return val_token.value
+        elif val_token.type == TokenType.NULL:
+            self.eat(TokenType.NULL)
+            return None
+        elif val_token.type == TokenType.TRUE:
+            self.eat(TokenType.TRUE)
+            return True
+        elif val_token.type == TokenType.FALSE:
+            self.eat(TokenType.FALSE)
+            return False
+        else:
+            raise SqlSyntaxError(f'Expected value but got {val_token.type}')
+
+    def update_statement(self) -> UpdateStatement:
+        """Parse UPDATE table SET col1=val1, col2=val2 [WHERE expr];"""
+        self.eat(TokenType.UPDATE)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+        self.eat(TokenType.SET)
+
+        # Parse SET clauses
+        set_clauses: list[tuple[str, Any]] = []
+        col = self.eat(TokenType.IDENTIFIER).value
+        self.eat(TokenType.EQ)
+        set_clauses.append((col, self._parse_literal_value()))
+
+        while self.current_token().type == TokenType.COMMA:
+            self.eat(TokenType.COMMA)
+            col = self.eat(TokenType.IDENTIFIER).value
+            self.eat(TokenType.EQ)
+            set_clauses.append((col, self._parse_literal_value()))
+
+        # Optional WHERE
+        where_clause = None
+        if self.current_token().type == TokenType.WHERE:
+            self.eat(TokenType.WHERE)
+            where_clause = WhereClause(self.parse_expression())
+
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+
+        return UpdateStatement(table_name, set_clauses, where_clause)
