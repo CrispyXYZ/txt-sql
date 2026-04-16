@@ -2,7 +2,7 @@ import sys
 from .engine import execute_sql
 
 def print_table(rows):
-    """Prints a list of dictionaries as a formatted ASCII table."""
+    """Prints a list of dictionaries as a formatted ASCII table with borders."""
     if not rows:
         print("Empty set.")
         return
@@ -17,14 +17,23 @@ def print_table(rows):
             val = str(row.get(h, ''))
             widths[h] = max(widths[h], len(val))
     
+    # Create separator line
+    # Format: +--+--+
+    separator = "+" + "+".join("-" * (widths[h] + 2) for h in headers) + "+"
+    
     # Header
-    header_str = " | ".join(h.ljust(widths[h]) for h in headers)
+    print()
+    print(separator)
+    header_str = "|" + "|".join(f" {h.ljust(widths[h])} " for h in headers) + "|"
     print(header_str)
-    print("-+-".join("-" * widths[h] for h in headers))
+    print(separator)
     
     # Rows
     for row in rows:
-        print(" | ".join(str(row.get(h, '')).ljust(widths[h]) for h in headers))
+        row_str = "|" + "|".join(f" {str(row.get(h, '')).ljust(widths[h])} " for h in headers) + "|"
+        print(row_str)
+    
+    print(separator)
 
 def run_cli():
     """
