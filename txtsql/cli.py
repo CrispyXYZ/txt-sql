@@ -1,7 +1,10 @@
+from collections.abc import Mapping, Sequence
 from typing import Any
+
 from .engine import execute_sql
 
-def print_table(rows: list[dict[str, Any]]) -> None:
+
+def print_table(rows: Sequence[Mapping[str, Any]]) -> None:
     """Prints a list of dictionaries as a formatted ASCII table with borders."""
     if not rows:
         print("Empty set.")
@@ -35,7 +38,7 @@ def print_table(rows: list[dict[str, Any]]) -> None:
     
     print(separator)
 
-def run_cli():
+def run_cli() -> None:
     """
     Starts an interactive CLI loop.
     Reads SQL input, executes it, and prints the result in a table format.
@@ -60,7 +63,8 @@ def run_cli():
             else:
                 print("Query OK.")
                 
-        except EOFError:
+        except (EOFError, KeyboardInterrupt):
+            print()
             break
         except Exception as e:
             print(f"Error: {e}")
