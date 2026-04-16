@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -27,6 +27,21 @@ class InsertValues:
 class LogicalOp(Enum):
     AND = 'and'
     OR = 'or'
+
+
+class AggFunc(Enum):
+    COUNT = 'COUNT'
+    SUM = 'SUM'
+    AVG = 'AVG'
+    MIN = 'MIN'
+    MAX = 'MAX'
+
+
+@dataclass(slots=True, frozen=True)
+class AggregateColumn:
+    func: AggFunc
+    column: str | None  # None for COUNT(*)
+    alias: str
 
 
 class ComparisonOp(Enum):
@@ -94,8 +109,11 @@ class DeleteStatement:
 class SelectStatement:
     table_name: str
     columns: list[str] | None  # None means SELECT *
+    aggregates: list[AggregateColumn]  # aggregate expressions; empty list for non-aggregate queries
     distinct: bool
     where_clause: WhereClause | None
+    group_by: list[str] | None
+    having: WhereClause | None
     order_by: list[tuple[str, bool]] | None  # (column, desc)
     limit: int | None
     offset: int
@@ -373,7 +391,7 @@ class Parser:
         return DeleteStatement(table_name, where_clause)
 
     def select_statement(self) -> SelectStatement:
-        """Parse SELECT [DISTINCT] col1, col2, * FROM table [WHERE expr] [ORDER BY col [ASC|DESC], ...] [LIMIT n] [OFFSET n];"""
+        """Parse SELECT [DISTINCT] col1, agg_func(col) AS alias, * FROM table [WHERE expr] [GROUP BY col, ...] [HAVING expr] [ORDER BY col [ASC|DESC], ...] [LIMIT n] [OFFSET n];"""
         self.eat(TokenType.SELECT)
 
         # Optional DISTINCT
@@ -384,15 +402,16 @@ class Parser:
 
         # Column list or *
         columns: list[str] | None
+        aggregates: list[AggregateColumn] = []
         if self.current_token().type == TokenType.STAR:
             self.eat(TokenType.STAR)
             columns = None
         else:
             columns = []
-            columns.append(self.eat(TokenType.IDENTIFIER).value)
+            self._parse_select_item(columns, aggregates)
             while self.current_token().type == TokenType.COMMA:
                 self.eat(TokenType.COMMA)
-                columns.append(self.eat(TokenType.IDENTIFIER).value)
+                self._parse_select_item(columns, aggregates)
 
         self.eat(TokenType.FROM)
         table_name = self.eat(TokenType.IDENTIFIER).value
@@ -402,6 +421,22 @@ class Parser:
         if self.current_token().type == TokenType.WHERE:
             self.eat(TokenType.WHERE)
             where_clause = WhereClause(self.parse_expression())
+
+        # Optional GROUP BY
+        group_by: list[str] | None = None
+        if self.current_token().type == TokenType.GROUP:
+            self.eat(TokenType.GROUP)
+            self.eat(TokenType.BY)
+            group_by = [self.eat(TokenType.IDENTIFIER).value]
+            while self.current_token().type == TokenType.COMMA:
+                self.eat(TokenType.COMMA)
+                group_by.append(self.eat(TokenType.IDENTIFIER).value)
+
+        # Optional HAVING
+        having: WhereClause | None = None
+        if self.current_token().type == TokenType.HAVING:
+            self.eat(TokenType.HAVING)
+            having = WhereClause(self.parse_expression())
 
         # Optional ORDER BY
         order_by: list[tuple[str, bool]] | None = None
@@ -443,7 +478,34 @@ class Parser:
         if self.current_token().type == TokenType.SEMICOLON:
             self.eat(TokenType.SEMICOLON)
 
-        return SelectStatement(table_name, columns, distinct, where_clause, order_by, limit, offset)
+        return SelectStatement(table_name, columns, aggregates, distinct, where_clause, group_by, having, order_by, limit, offset)
+
+    _AGG_FUNC_TOKEN_MAP = {
+        TokenType.COUNT: AggFunc.COUNT,
+        TokenType.SUM: AggFunc.SUM,
+        TokenType.AVG: AggFunc.AVG,
+        TokenType.MIN: AggFunc.MIN,
+        TokenType.MAX: AggFunc.MAX,
+    }
+
+    def _parse_select_item(self, columns: list[str], aggregates: list[AggregateColumn]) -> None:
+        """Parse a single SELECT list item: either a plain column name or an aggregate function call."""
+        token = self.current_token()
+        if token.type in self._AGG_FUNC_TOKEN_MAP:
+            func = self._AGG_FUNC_TOKEN_MAP[token.type]
+            self.pos += 1  # consume function name token
+            self.eat(TokenType.LPAREN)
+            if func == AggFunc.COUNT and self.current_token().type == TokenType.STAR:
+                self.eat(TokenType.STAR)
+                col: str | None = None
+            else:
+                col = self.eat(TokenType.IDENTIFIER).value
+            self.eat(TokenType.RPAREN)
+            self.eat(TokenType.AS)
+            alias = self.eat(TokenType.IDENTIFIER).value
+            aggregates.append(AggregateColumn(func, col, alias))
+        else:
+            columns.append(self.eat(TokenType.IDENTIFIER).value)
 
     def _parse_literal_value(self) -> Any:
         """Parse a literal value token (STRING, NUMBER, BINARY, NULL, TRUE, FALSE)."""
