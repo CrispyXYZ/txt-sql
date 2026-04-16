@@ -211,19 +211,11 @@ class Parser:
         while True:
             self.eat(TokenType.LPAREN)
             values = []
-            first_value = self.current_token()
-            if first_value.type not in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
-                raise SqlSyntaxError(f'Expected value but got {first_value.type}')
-            values.append(first_value.value)
-            self.pos += 1
+            values.append(self._parse_literal_value())
 
             while self.current_token().type == TokenType.COMMA:
                 self.eat(TokenType.COMMA)
-                value_token = self.current_token()
-                if value_token.type not in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
-                    raise SqlSyntaxError(f'Expected value but got {value_token.type}')
-                values.append(value_token.value)
-                self.pos += 1
+                values.append(self._parse_literal_value())
 
             self.eat(TokenType.RPAREN)
             all_values.append(values)

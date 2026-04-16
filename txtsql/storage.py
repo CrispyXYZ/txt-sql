@@ -13,6 +13,12 @@ from .types import Types, DataValue
 _log = logging.getLogger(__name__)
 metadata_filename = 'metadata.txt'
 
+# Sentinel stored in TSV to represent SQL NULL
+_NULL_SENTINEL = '\\N'
+
+# Sentinel object used internally to mean "leave this column unchanged" during UPDATE
+_UNCHANGED = object()
+
 type RowDict = dict[str, DataValue]
 
 
@@ -92,10 +98,10 @@ def _binary_to_string(binary: bytes) -> str:
     return base64.b64encode(binary).decode()
 
 
-def _data_to_string(value: DataValue, type_def: Types) -> str | None:
-    """ Convert data type to string, usually for writing. Returns None if value is None (indicates no change). """
+def _data_to_string(value: DataValue, type_def: Types) -> str:
+    """ Convert data type to string for writing to file. None (SQL NULL) is stored as _NULL_SENTINEL. """
     if value is None:
-        return None
+        return _NULL_SENTINEL
     match type_def:
         case Types.NUMBER:
             return _number_to_string(Decimal(value))
@@ -103,11 +109,13 @@ def _data_to_string(value: DataValue, type_def: Types) -> str | None:
             return _binary_to_string(value)
         case Types.STRING:
             return value
-    return None
+    return _NULL_SENTINEL
 
 
 def _string_to_data(string: str, type_def: Types) -> str | Decimal | bytes | None:
-    """ Convert a raw string (usually read from file) to data type. """
+    """ Convert a raw string (usually read from file) to data type. _NULL_SENTINEL becomes None. """
+    if string == _NULL_SENTINEL:
+        return None
     match type_def:
         case Types.NUMBER:
             return _string_to_number(string)
@@ -139,8 +147,7 @@ class Table:
                 pass
 
     def insert_values(self, values: RowDict) -> None:
-        """ This method does not accept None in values parameter. Use empty string instead. TODO use better placeholder """
-        # TODO insert multiple lines
+        """ Insert a row into the table. Use None to represent SQL NULL. """
         _log.debug(f'Inserting values into {self.name}: {values}')
         with open(self.filename, 'a', encoding='utf-8', newline='') as file:
             writer = csv.writer(file, delimiter='\t')
@@ -150,21 +157,23 @@ class Table:
 
     def update(self, values: RowDict, where: Callable[[RowDict], bool] | None = None) -> None:
         """
-        This method does not accept None in values parameter. Use empty string instead. TODO use better placeholder
-        :param values: Dictionary of values to update
+        :param values: Dictionary of values to update. Use None for SQL NULL.
         :param where: Function which takes a row dictionary as parameter, returns bool
         """
         _log.debug(f'Updating values of {self.name}: {values}')
 
-        def_count: int = len(self.defs)  # number of columns in the table, also the count of the table defs
+        def_count: int = len(self.defs)
 
-        # build a list of new values for each column in the order of self.defs. None represents no change
-        updated_values: list[str | None] = [_data_to_string(values.get(key), value) for key, value in
-                                            self.defs.items()]  # get method returns None if not found
+        # Build a list of new string values for each column in the order of self.defs.
+        # _UNCHANGED means this column should not be modified.
+        updated_values: list[str | object] = [
+            _data_to_string(values[key], value) if key in values else _UNCHANGED
+            for key, value in self.defs.items()
+        ]
         _log.debug(f'Generated values: {updated_values}')
 
         # check if every column stayed unchanged
-        if all(value is None for value in updated_values):
+        if all(value is _UNCHANGED for value in updated_values):
             _log.warning(f'No values to update: {values}')
             return
 
@@ -175,8 +184,8 @@ class Table:
                 # determine whether this row should be updated
                 if where is None or where(
                         {key: _string_to_data(val, typ) for val, (key, typ) in zip(row, self.defs.items())}):
-                    # keep original value where updated_values[i] is None, otherwise update
-                    new_row = [row[i] if updated_values[i] is None else updated_values[i] for i in range(def_count)]
+                    # keep original value where updated_values[i] is _UNCHANGED, otherwise update
+                    new_row = [row[i] if updated_values[i] is _UNCHANGED else updated_values[i] for i in range(def_count)]
                 else:
                     new_row = row
                 table_values.append(new_row)
@@ -311,9 +320,12 @@ class Table:
 
         # Handle ORDER BY
         if order_by:
-            for item in reversed(order_by):
-                col, desc = item
-                result_rows.sort(key=lambda r: r[col], reverse=desc)
+            for col, desc in reversed(order_by):
+                # Keep NULLs last regardless of sort direction
+                null_rows = [r for r in result_rows if r.get(col) is None]
+                non_null_rows = [r for r in result_rows if r.get(col) is not None]
+                non_null_rows.sort(key=lambda r: r[col], reverse=desc)
+                result_rows = non_null_rows + null_rows
 
         if offset:
             result_rows = result_rows[offset:]

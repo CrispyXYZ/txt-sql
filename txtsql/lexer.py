@@ -104,6 +104,13 @@ class Lexer:
         while self.current_char() is not None and self.current_char().isdigit():
             num_str += self.current_char()
             self.advance()
+        # Support decimal point (e.g. 3.14) - require at least one digit after the point
+        if self.current_char() == '.' and self.peek() is not None and self.peek().isdigit():
+            num_str += '.'
+            self.advance()
+            while self.current_char() is not None and self.current_char().isdigit():
+                num_str += self.current_char()
+                self.advance()
         return Token(TokenType.NUMBER, Decimal(num_str), self.line, start_col)
 
     def read_string(self) -> Token:
