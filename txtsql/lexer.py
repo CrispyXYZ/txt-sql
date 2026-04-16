@@ -104,8 +104,8 @@ class Lexer:
         while self.current_char() is not None and self.current_char().isdigit():
             num_str += self.current_char()
             self.advance()
-        # Support decimal point (e.g. 3.14)
-        if self.current_char() == '.' and (self.peek() is None or self.peek().isdigit()):
+        # Support decimal point (e.g. 3.14) - require at least one digit after the point
+        if self.current_char() == '.' and self.peek() is not None and self.peek().isdigit():
             num_str += '.'
             self.advance()
             while self.current_char() is not None and self.current_char().isdigit():

@@ -324,7 +324,7 @@ class Table:
                 # Keep NULLs last regardless of sort direction
                 null_rows = [r for r in result_rows if r.get(col) is None]
                 non_null_rows = [r for r in result_rows if r.get(col) is not None]
-                non_null_rows.sort(key=lambda r, c=col: r[c], reverse=desc)
+                non_null_rows.sort(key=lambda r: r[col], reverse=desc)
                 result_rows = non_null_rows + null_rows
 
         if offset:
