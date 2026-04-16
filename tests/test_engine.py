@@ -293,3 +293,104 @@ class TestPersistence:
         rows = execute_sql('SELECT * FROM t')
         assert rows[0]['name'] is None
         execute_sql('DROP TABLE t')
+
+
+# ---------------------------------------------------------------------------
+# Aggregate queries
+# ---------------------------------------------------------------------------
+
+class TestAggregate:
+    def setup_method(self):
+        execute_sql('CREATE TABLE emp (id NUMBER, dept STRING, salary NUMBER)')
+        execute_sql("INSERT INTO emp VALUES (1, 'Sales', 5000)")
+        execute_sql("INSERT INTO emp VALUES (2, 'Sales', 6000)")
+        execute_sql("INSERT INTO emp VALUES (3, 'Eng', 8000)")
+        execute_sql("INSERT INTO emp VALUES (4, 'Eng', 9000)")
+        execute_sql("INSERT INTO emp VALUES (5, 'Eng', NULL)")
+
+    def teardown_method(self):
+        try:
+            execute_sql('DROP TABLE emp')
+        except Exception:
+            pass
+
+    def test_count_star(self):
+        rows = execute_sql('SELECT COUNT(*) AS cnt FROM emp')
+        assert len(rows) == 1
+        assert rows[0]['cnt'] == Decimal('5')
+
+    def test_count_column_excludes_null(self):
+        rows = execute_sql('SELECT COUNT(salary) AS cnt FROM emp')
+        assert rows[0]['cnt'] == Decimal('4')
+
+    def test_sum(self):
+        rows = execute_sql('SELECT SUM(salary) AS total FROM emp')
+        assert rows[0]['total'] == Decimal('28000')
+
+    def test_avg(self):
+        rows = execute_sql('SELECT AVG(salary) AS avg_sal FROM emp')
+        assert rows[0]['avg_sal'] == Decimal('7000')
+
+    def test_min(self):
+        rows = execute_sql('SELECT MIN(salary) AS min_sal FROM emp')
+        assert rows[0]['min_sal'] == Decimal('5000')
+
+    def test_max(self):
+        rows = execute_sql('SELECT MAX(salary) AS max_sal FROM emp')
+        assert rows[0]['max_sal'] == Decimal('9000')
+
+    def test_agg_with_where(self):
+        rows = execute_sql("SELECT COUNT(*) AS cnt FROM emp WHERE dept = 'Eng'")
+        assert rows[0]['cnt'] == Decimal('3')
+
+    def test_group_by(self):
+        rows = execute_sql('SELECT dept, COUNT(*) AS cnt FROM emp GROUP BY dept ORDER BY dept ASC')
+        assert len(rows) == 2
+        eng = next(r for r in rows if r['dept'] == 'Eng')
+        sales = next(r for r in rows if r['dept'] == 'Sales')
+        assert eng['cnt'] == Decimal('3')
+        assert sales['cnt'] == Decimal('2')
+
+    def test_group_by_sum(self):
+        rows = execute_sql('SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept ORDER BY dept ASC')
+        eng = next(r for r in rows if r['dept'] == 'Eng')
+        sales = next(r for r in rows if r['dept'] == 'Sales')
+        assert eng['total'] == Decimal('17000')
+        assert sales['total'] == Decimal('11000')
+
+    def test_group_by_avg(self):
+        rows = execute_sql('SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept ORDER BY dept ASC')
+        eng = next(r for r in rows if r['dept'] == 'Eng')
+        sales = next(r for r in rows if r['dept'] == 'Sales')
+        assert eng['avg_sal'] == Decimal('8500')
+        assert sales['avg_sal'] == Decimal('5500')
+
+    def test_group_by_min_max(self):
+        rows = execute_sql('SELECT dept, MIN(salary) AS lo, MAX(salary) AS hi FROM emp GROUP BY dept ORDER BY dept ASC')
+        eng = next(r for r in rows if r['dept'] == 'Eng')
+        sales = next(r for r in rows if r['dept'] == 'Sales')
+        assert eng['lo'] == Decimal('8000')
+        assert eng['hi'] == Decimal('9000')
+        assert sales['lo'] == Decimal('5000')
+        assert sales['hi'] == Decimal('6000')
+
+    def test_having(self):
+        rows = execute_sql('SELECT dept, COUNT(*) AS cnt FROM emp GROUP BY dept HAVING cnt > 2')
+        assert len(rows) == 1
+        assert rows[0]['dept'] == 'Eng'
+
+    def test_agg_null_returns_none_for_empty_group(self):
+        # SUM/AVG/MIN/MAX on a group with all-NULL values should return None
+        execute_sql('CREATE TABLE nulltest (x NUMBER)')
+        execute_sql('INSERT INTO nulltest VALUES (NULL)')
+        try:
+            rows = execute_sql('SELECT SUM(x) AS s FROM nulltest')
+            assert rows[0]['s'] is None
+            rows = execute_sql('SELECT AVG(x) AS a FROM nulltest')
+            assert rows[0]['a'] is None
+            rows = execute_sql('SELECT MIN(x) AS lo FROM nulltest')
+            assert rows[0]['lo'] is None
+            rows = execute_sql('SELECT MAX(x) AS hi FROM nulltest')
+            assert rows[0]['hi'] is None
+        finally:
+            execute_sql('DROP TABLE nulltest')

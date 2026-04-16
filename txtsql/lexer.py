@@ -23,11 +23,19 @@ class TokenType(StrEnum):
     UPDATE = 'UPDATE'
     SET = 'SET'
     ORDER = 'ORDER'
+    GROUP = 'GROUP'
     BY = 'BY'
+    HAVING = 'HAVING'
     ASC = 'ASC'
     DESC = 'DESC'
     LIMIT = 'LIMIT'
     OFFSET = 'OFFSET'
+    AS = 'AS'
+    COUNT = 'COUNT'
+    SUM = 'SUM'
+    AVG = 'AVG'
+    MIN = 'MIN'
+    MAX = 'MAX'
 
     DELETE = 'DELETE'
     FROM = 'FROM'
@@ -169,8 +177,24 @@ class Lexer:
                 token_type = TokenType.SET
             case 'ORDER':
                 token_type = TokenType.ORDER
+            case 'GROUP':
+                token_type = TokenType.GROUP
             case 'BY':
                 token_type = TokenType.BY
+            case 'HAVING':
+                token_type = TokenType.HAVING
+            case 'AS':
+                token_type = TokenType.AS
+            case 'COUNT':
+                token_type = TokenType.COUNT
+            case 'SUM':
+                token_type = TokenType.SUM
+            case 'AVG':
+                token_type = TokenType.AVG
+            case 'MIN':
+                token_type = TokenType.MIN
+            case 'MAX':
+                token_type = TokenType.MAX
             case 'ASC':
                 token_type = TokenType.ASC
             case 'DESC':
