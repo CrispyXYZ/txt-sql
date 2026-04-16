@@ -40,7 +40,7 @@ def run_cli():
     Starts an interactive CLI loop.
     Reads SQL input, executes it, and prints the result in a table format.
     """
-    print("Welcome to TxTSQL CLI. Type your SQL statement and press Enter.")
+    print("Welcome to TxtSql CLI. Type your SQL statement and press Enter.")
     print("Type 'exit' or 'quit' to exit.")
     
     while True:
