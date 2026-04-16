@@ -1,4 +1,3 @@
-import sys
 from .engine import execute_sql
 
 def print_table(rows):
