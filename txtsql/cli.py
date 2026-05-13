@@ -1,7 +1,9 @@
+import traceback
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .engine import execute_sql
+from .exceptions import TxtSqlError
 
 
 def print_table(rows: Sequence[Mapping[str, Any]]) -> None:
@@ -66,8 +68,11 @@ def run_cli() -> None:
         except (EOFError, KeyboardInterrupt):
             print()
             break
-        except Exception as e:
+        except TxtSqlError as e:
             print(f"Error: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            traceback.print_exc()
 
 if __name__ == "__main__":
     run_cli()

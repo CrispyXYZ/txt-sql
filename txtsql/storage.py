@@ -16,8 +16,11 @@ metadata_filename = 'metadata.txt'
 # Sentinel stored in TSV to represent SQL NULL
 _NULL_SENTINEL = '\\N'
 
+class _Unchanged:
+    pass
+
 # Sentinel object used internally to mean "leave this column unchanged" during UPDATE
-_UNCHANGED = object()
+_UNCHANGED = _Unchanged()
 
 type RowDict = dict[str, DataValue]
 
@@ -102,14 +105,13 @@ def _data_to_string(value: DataValue, type_def: Types) -> str:
     """ Convert data type to string for writing to file. None (SQL NULL) is stored as _NULL_SENTINEL. """
     if value is None:
         return _NULL_SENTINEL
-    match type_def:
+    match type_def: # We assume the type here is absolutely right
         case Types.NUMBER:
             return _number_to_string(Decimal(value))
         case Types.BINARY:
             return _binary_to_string(value)
         case Types.STRING:
             return value
-    return _NULL_SENTINEL
 
 
 def _string_to_data(string: str, type_def: Types) -> str | Decimal | bytes | None:
@@ -123,7 +125,6 @@ def _string_to_data(string: str, type_def: Types) -> str | Decimal | bytes | Non
             return _string_to_binary(string)
         case Types.STRING:
             return string
-    return None
 
 
 class Table:
@@ -166,7 +167,7 @@ class Table:
 
         # Build a list of new string values for each column in the order of self.defs.
         # _UNCHANGED means this column should not be modified.
-        updated_values: list[str | object] = [
+        updated_values: list[str | _Unchanged] = [
             _data_to_string(values[key], value) if key in values else _UNCHANGED
             for key, value in self.defs.items()
         ]
@@ -188,7 +189,7 @@ class Table:
                     new_row = [row[i] if updated_values[i] is _UNCHANGED else updated_values[i] for i in range(def_count)]
                 else:
                     new_row = row
-                table_values.append(new_row)
+                table_values.append(new_row) # The analyzer may fail to analyze the type here, ignore it.
 
         _log.debug(f'Updated values: {table_values}')
 
@@ -327,7 +328,7 @@ class Table:
                 non_null_rows.sort(key=lambda r: r[col], reverse=desc)
                 result_rows = non_null_rows + null_rows
 
-        if offset:
+        if offset > 0:
             result_rows = result_rows[offset:]
         if limit is not None:
             result_rows = result_rows[:limit]

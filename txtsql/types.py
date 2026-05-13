@@ -4,7 +4,7 @@ from enum import unique, StrEnum
 type NumberValue = Decimal | str | int
 type StringValue = str
 type BinaryValue = bytes
-type DataValue = NumberValue | StringValue | BinaryValue
+type DataValue = NumberValue | StringValue | BinaryValue | None
 
 
 @unique

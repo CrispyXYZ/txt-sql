@@ -394,3 +394,86 @@ class TestAggregate:
             assert rows[0]['hi'] is None
         finally:
             execute_sql('DROP TABLE nulltest')
+
+
+# ---------------------------------------------------------------------------
+# NULL comparison semantics (standard SQL)
+# ---------------------------------------------------------------------------
+
+class TestNullComparison:
+    def setup_method(self):
+        execute_sql('CREATE TABLE t (id NUMBER, score NUMBER)')
+        execute_sql('INSERT INTO t VALUES (1, 100)')
+        execute_sql('INSERT INTO t VALUES (2, NULL)')
+        execute_sql('INSERT INTO t VALUES (3, 200)')
+
+    def teardown_method(self):
+        try:
+            execute_sql('DROP TABLE t')
+        except Exception:
+            pass
+
+    def test_null_eq_null_returns_no_rows(self):
+        rows = execute_sql('SELECT * FROM t WHERE score = NULL')
+        assert len(rows) == 0
+
+    def test_null_ne_null_returns_no_rows(self):
+        rows = execute_sql('SELECT * FROM t WHERE score <> NULL')
+        assert len(rows) == 0
+
+    def test_null_eq_non_null_returns_no_rows(self):
+        rows = execute_sql('SELECT * FROM t WHERE score = 100')
+        assert len(rows) == 1
+
+    def test_is_null_finds_null_rows(self):
+        rows = execute_sql('SELECT * FROM t WHERE score IS NULL')
+        assert len(rows) == 1
+        assert rows[0]['id'] == Decimal('2')
+
+    def test_is_not_null_excludes_null_rows(self):
+        rows = execute_sql('SELECT * FROM t WHERE score IS NOT NULL')
+        assert len(rows) == 2
+
+
+# ---------------------------------------------------------------------------
+# Aggregate validation
+# ---------------------------------------------------------------------------
+
+class TestAggregateValidation:
+    def setup_method(self):
+        execute_sql('CREATE TABLE emp (id NUMBER, dept STRING, name STRING, salary NUMBER)')
+
+    def teardown_method(self):
+        try:
+            execute_sql('DROP TABLE emp')
+        except Exception:
+            pass
+
+    def test_agg_with_plain_col_no_group_by_raises_error(self):
+        with pytest.raises(SqlSyntaxError, match='GROUP BY'):
+            execute_sql('SELECT dept, COUNT(*) AS cnt FROM emp')
+
+    def test_agg_with_non_grouped_col_raises_error(self):
+        with pytest.raises(SqlSyntaxError, match='GROUP BY'):
+            execute_sql('SELECT dept, name, COUNT(*) AS cnt FROM emp GROUP BY dept')
+
+    def test_having_without_group_by(self):
+        execute_sql("INSERT INTO emp VALUES (1, 'Sales', 'Alice', 5000)")
+        execute_sql("INSERT INTO emp VALUES (2, 'Eng', 'Bob', 8000)")
+        rows = execute_sql('SELECT COUNT(*) AS cnt FROM emp HAVING cnt > 1')
+        assert len(rows) == 1
+        assert rows[0]['cnt'] == Decimal('2')
+
+    def test_where_group_by_having_combined(self):
+        execute_sql("INSERT INTO emp VALUES (1, 'Sales', 'Alice', 5000)")
+        execute_sql("INSERT INTO emp VALUES (2, 'Sales', 'Bob', 6000)")
+        execute_sql("INSERT INTO emp VALUES (3, 'Eng', 'Charlie', 8000)")
+        rows = execute_sql(
+            "SELECT dept, COUNT(*) AS cnt FROM emp WHERE salary > 5000 "
+            "GROUP BY dept HAVING cnt > 0 ORDER BY dept ASC"
+        )
+        assert len(rows) == 2
+        sales = next(r for r in rows if r['dept'] == 'Sales')
+        eng = next(r for r in rows if r['dept'] == 'Eng')
+        assert sales['cnt'] == Decimal('1')  # only Bob
+        assert eng['cnt'] == Decimal('1')    # only Charlie

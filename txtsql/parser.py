@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -477,6 +477,19 @@ class Parser:
 
         if self.current_token().type == TokenType.SEMICOLON:
             self.eat(TokenType.SEMICOLON)
+
+        if aggregates:
+            if group_by is None:
+                if columns:
+                    raise SqlSyntaxError(
+                        'SELECT with aggregate functions and plain columns requires GROUP BY'
+                    )
+            else:
+                non_grouped = [c for c in columns if c not in group_by]
+                if non_grouped:
+                    raise SqlSyntaxError(
+                        f'Column "{non_grouped[0]}" must appear in GROUP BY clause when used with aggregate functions'
+                    )
 
         return SelectStatement(table_name, columns, aggregates, distinct, where_clause, group_by, having, order_by, limit, offset)
 

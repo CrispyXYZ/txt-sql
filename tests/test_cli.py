@@ -125,3 +125,14 @@ class TestRunCli:
             run_cli()
         out = capsys.readouterr().out
         assert "Query OK." in out
+
+    def test_system_error_shows_traceback(self, capsys):
+        with patch("builtins.input", side_effect=[
+            "CREATE TABLE t3 (id NUMBER)",
+            RuntimeError("Something went wrong"),
+            "exit",
+        ]):
+            run_cli()
+        captured = capsys.readouterr()
+        assert "Unexpected error" in captured.out
+        assert "Traceback" in captured.err

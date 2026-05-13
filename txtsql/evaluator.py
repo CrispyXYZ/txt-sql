@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any
 
 from .parser import (
-    Expression, LiteralExpression, ColumnExpression, NullCheckExpression,
+    Expression, ColumnExpression, NullCheckExpression,
     ConditionExpression, LogicalExpression, LogicalOp, ComparisonOp
 )
 from .storage import RowDict
@@ -21,11 +21,6 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Call
     def eval_expr(expr: Expression) -> Callable[[RowDict], bool]:
         """Internal recursive evaluation function"""
         match expr:
-            case LiteralExpression(value):
-                def _literal(row: RowDict) -> bool:
-                    return _to_bool(value)
-                return _literal
-
             case ColumnExpression(column_name):
                 def _column(row: RowDict) -> bool:
                     if column_name not in row:
@@ -115,12 +110,7 @@ def _check_type_compatibility(value: Any, expected_type: Types) -> bool:
 def _compare(left: Any, right: Any, op: ComparisonOp) -> bool:
     """Execute comparison operations, handling NULL and type conversion"""
     if left is None or right is None:
-        if op == ComparisonOp.EQ:
-            return left is None and right is None
-        elif op == ComparisonOp.NE:
-            return not (left is None and right is None)
-        else:
-            return False
+        return False
 
     if isinstance(left, (int, float, Decimal)) and isinstance(right, (int, float, Decimal)):
         l_val = Decimal(left)
