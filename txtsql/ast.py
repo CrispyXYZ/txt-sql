@@ -3,14 +3,12 @@
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
-from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
 
-type LiteralValue = str | Decimal | bytes | None | bool
+type LiteralValue = str | Decimal | None | bool
 
 
 # ---------------------------------------------------------------------------

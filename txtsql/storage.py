@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import csv
 import logging
 import os
@@ -93,16 +92,8 @@ def _string_to_number(string: str) -> Decimal:
     return Decimal(string)
 
 
-def _string_to_binary(string: str) -> bytes:
-    return base64.b64decode(string)
-
-
 def _number_to_string(number: Decimal) -> str:
     return str(number)
-
-
-def _binary_to_string(binary: bytes) -> str:
-    return base64.b64encode(binary).decode()
 
 
 def _data_to_string(value: DataValue, type_def: Types) -> str:
@@ -112,8 +103,6 @@ def _data_to_string(value: DataValue, type_def: Types) -> str:
     match type_def:
         case Types.NUMBER:
             return _number_to_string(Decimal(value))
-        case Types.BINARY:
-            return _binary_to_string(value)
         case Types.STRING:
             return value
 
@@ -125,8 +114,6 @@ def _string_to_data(string: str, type_def: Types) -> DataValue:
     match type_def:
         case Types.NUMBER:
             return _string_to_number(string)
-        case Types.BINARY:
-            return _string_to_binary(string)
         case Types.STRING:
             return string
 

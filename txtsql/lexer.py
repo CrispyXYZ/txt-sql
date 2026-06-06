@@ -14,7 +14,6 @@ class TokenType(StrEnum):
     VALUES = 'VALUES'
     TYPE_STRING = 'STRING'
     TYPE_NUMBER = 'NUMBER'
-    TYPE_BINARY = 'BINARY'
 
     SELECT = 'SELECT'
     DISTINCT = 'DISTINCT'
@@ -63,11 +62,10 @@ class TokenType(StrEnum):
 
     STRING = 'STRING'
     NUMBER = 'NUMBER'
-    BINARY = 'BINARY'
     IDENTIFIER = 'IDENTIFIER'
 
 
-type TokenValue = str | Decimal | bytes | None
+type TokenValue = str | Decimal | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,21 +131,6 @@ class Lexer:
         if self.current_char() == "'":
             self.advance()
         return Token(TokenType.STRING, string_str, self.line, start_col)
-
-    def read_binary(self) -> Token:
-        start_col = self.column
-
-        self.advance()
-        self.advance()
-
-        hex_chars = ''
-        while self.current_char() is not None and self.current_char() in '0123456789abcdefABCDEF':
-            hex_chars += self.current_char()
-            self.advance()
-
-        data = bytes.fromhex(hex_chars)
-
-        return Token(TokenType.BINARY, data, self.line, start_col)
 
     def read_identifier_or_keyword(self) -> Token:
         start_col = self.column
@@ -231,8 +214,6 @@ class Lexer:
             case 'NUMBER' | 'DECIMAL':
                 token_type = TokenType.NUMBER
                 identifier = 'NUMBER'
-            case 'BINARY':
-                token_type = TokenType.BINARY
             case _:
                 token_type = TokenType.IDENTIFIER
         return Token(token_type, identifier, self.line, start_col)
@@ -286,10 +267,7 @@ class Lexer:
                     return Token(TokenType.GT, '>', self.line, self.column - 1)
             case _:
                 if ch.isdigit():
-                    if ch == '0' and self.peek() in ('x', 'X'):
-                        return self.read_binary()
-                    else:
-                        return self.read_number()
+                    return self.read_number()
                 if ch == "'":
                     return self.read_string()
                 if ch.isalpha() or ch == '_':

@@ -83,8 +83,8 @@ class Parser:
 
     def _parse_type(self) -> Token:
         token = self.current_token()
-        if token.type not in (TokenType.TYPE_STRING, TokenType.TYPE_NUMBER, TokenType.TYPE_BINARY):
-            raise SqlSyntaxError(f'Expected type STRING, NUMBER or BINARY, but got {token.type}')
+        if token.type not in (TokenType.TYPE_STRING, TokenType.TYPE_NUMBER):
+            raise SqlSyntaxError(f'Expected type STRING or NUMBER, but got {token.type}')
         self.pos += 1
         return token
 
@@ -112,8 +112,7 @@ class Parser:
         all_values = []
         while True:
             self.eat(TokenType.LPAREN)
-            values = []
-            values.append(self._parse_literal_value())
+            values = [self._parse_literal_value()]
 
             while self.current_token().type == TokenType.COMMA:
                 self.eat(TokenType.COMMA)
@@ -224,7 +223,7 @@ class Parser:
 
         # Parse literal value
         literal_token = self.current_token()
-        if literal_token.type in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
+        if literal_token.type in (TokenType.STRING, TokenType.NUMBER):
             self.pos += 1
             literal = LiteralExpression(literal_token.value)
         elif literal_token.type == TokenType.NULL:
@@ -405,9 +404,9 @@ class Parser:
             columns.append(self.eat(TokenType.IDENTIFIER).value)
 
     def _parse_literal_value(self) -> LiteralValue:
-        """Parse a literal value (STRING, NUMBER, BINARY, NULL, TRUE, FALSE)."""
+        """Parse a literal value (STRING, NUMBER, NULL, TRUE, FALSE)."""
         val_token = self.current_token()
-        if val_token.type in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
+        if val_token.type in (TokenType.STRING, TokenType.NUMBER):
             self.pos += 1
             return val_token.value
         elif val_token.type == TokenType.NULL:

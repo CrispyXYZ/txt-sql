@@ -80,7 +80,7 @@ def _to_bool(value: object) -> bool:
         return value
     if isinstance(value, (int, float, Decimal)):
         return value != 0
-    if isinstance(value, (str, bytes)):
+    if isinstance(value, str):
         return bool(value)
     return bool(value)
 
@@ -94,9 +94,6 @@ def _check_type_compatibility(value: object, expected_type: Types) -> bool:
             return isinstance(value, (str, bool))
         case Types.NUMBER:
             return isinstance(value, (int, float, Decimal))
-        case Types.BINARY:
-            return isinstance(value, bytes)
-    return False
 
 
 def _compare(left: object, right: object, op: ComparisonOp) -> bool:
@@ -112,9 +109,6 @@ def _compare(left: object, right: object, op: ComparisonOp) -> bool:
     elif isinstance(left, str) and isinstance(right, (str, bool)):
         l_val = str(left)
         r_val = str(right) if isinstance(right, bool) else right
-    elif isinstance(left, bytes) and isinstance(right, bytes):
-        l_val = left
-        r_val = right
     else:
         if op == ComparisonOp.EQ:
             return False
@@ -139,5 +133,3 @@ def _compare(left: object, right: object, op: ComparisonOp) -> bool:
             return l_val >= r_val
         case ComparisonOp.LE:
             return l_val <= r_val
-
-    return False

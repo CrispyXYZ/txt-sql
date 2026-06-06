@@ -30,7 +30,7 @@ class TestCreateDrop:
             execute_sql('CREATE TABLE t (id NUMBER)')
 
     def test_create_multiple_types(self):
-        execute_sql('CREATE TABLE t (n NUMBER, s STRING, b BINARY)')
+        execute_sql('CREATE TABLE t (n NUMBER, s STRING)')
         execute_sql('DROP TABLE t')
 
 

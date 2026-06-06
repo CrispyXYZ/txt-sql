@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Callable
 
 from . import storage
 from .ast import (
@@ -7,8 +8,7 @@ from .ast import (
 )
 from .evaluator import evaluate_where
 from .exceptions import ColumnNotFoundError, TableNotFoundError
-from .types import Types, RowDict, DataValue
-
+from .types import Types, RowDict
 
 # ---------------------------------------------------------------------------
 # Type map: parser type strings → Types enum
@@ -17,7 +17,6 @@ from .types import Types, RowDict, DataValue
 _TYPE_MAP = {
     'STRING': Types.STRING,
     'NUMBER': Types.NUMBER,
-    'BINARY': Types.BINARY,
 }
 
 
@@ -140,7 +139,7 @@ def _group_rows(rows: list[RowDict], group_by: list[str] | None) -> dict[tuple, 
 def _apply_aggregations(
     groups: dict[tuple, list[RowDict]],
     group_by: list[str] | None,
-    aggregates: dict[str, object],  # actually dict[str, Callable]
+    aggregates: dict[str, Callable],
 ) -> list[RowDict]:
     """Apply aggregate functions to each group and return result rows."""
     result: list[RowDict] = []

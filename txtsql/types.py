@@ -6,11 +6,10 @@ from enum import unique, StrEnum
 # Atomic value types
 # ---------------------------------------------------------------------------
 
-type LiteralValue = str | Decimal | bytes | None | bool
+type LiteralValue = str | Decimal | None | bool
 type NumberValue = Decimal
 type StringValue = str
-type BinaryValue = bytes
-type DataValue = NumberValue | StringValue | BinaryValue | None
+type DataValue = NumberValue | StringValue | None
 
 
 # ---------------------------------------------------------------------------
@@ -28,4 +27,3 @@ type RowDict = dict[str, DataValue]
 class Types(StrEnum):
     NUMBER = 'NUMBER'
     STRING = 'STRING'
-    BINARY = 'BINARY'
