@@ -1,6 +1,6 @@
-from .ast import CreateTable, DeleteStatement, DropTable, InsertValues, SelectStatement, UpdateStatement
+from .ast import CreateTable, DeleteStatement, DropTable, InsertValues, ImportStatement, SelectStatement, UpdateStatement
 from .exceptions import EngineError
-from .executor import execute_drop, execute_create, execute_insert, execute_delete, execute_select, execute_update
+from .executor import execute_drop, execute_create, execute_insert, execute_delete, execute_import, execute_select, execute_update
 from .lexer import Lexer
 from .parser import Parser
 from .types import RowDict
@@ -28,5 +28,7 @@ def execute_sql(sql: str) -> list[RowDict] | int | None:
             return execute_select(statement)
         case UpdateStatement():
             return execute_update(statement)
+        case ImportStatement():
+            return execute_import(statement)
         case _:
             raise EngineError(f'Unsupported statement type: {type(statement)}')

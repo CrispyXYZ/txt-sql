@@ -4,7 +4,7 @@ from .ast import (
     NullCheckExpression, ConditionExpression, LogicalExpression,
     WhereClause, AggregateColumn,
     CreateTable, DropTable, InsertValues,
-    DeleteStatement, SelectStatement, UpdateStatement,
+    DeleteStatement, SelectStatement, UpdateStatement, ImportStatement,
 )
 from .exceptions import SqlSyntaxError
 from .lexer import Token, TokenType
@@ -33,7 +33,7 @@ class Parser:
             return self.tokens[self.pos + 1].type
         return TokenType.EOF
 
-    def parse(self) -> CreateTable | DropTable | InsertValues | DeleteStatement | SelectStatement | UpdateStatement:
+    def parse(self) -> CreateTable | DropTable | InsertValues | DeleteStatement | SelectStatement | UpdateStatement | ImportStatement:
         token = self.current_token()
         match token.type:
             case TokenType.CREATE:
@@ -48,6 +48,8 @@ class Parser:
                 return self.select_statement()
             case TokenType.UPDATE:
                 return self.update_statement()
+            case TokenType.IMPORT:
+                return self.import_statement()
             case _:
                 raise SqlSyntaxError(f'Unexpected statement: {token.type}')
 
@@ -447,3 +449,31 @@ class Parser:
             self.eat(TokenType.SEMICOLON)
 
         return UpdateStatement(table_name, set_clauses, where_clause)
+
+    def import_statement(self) -> ImportStatement:
+        """Parse IMPORT table_name [(col TYPE, ...)] FROM 'file_path';"""
+        self.eat(TokenType.IMPORT)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+
+        # Optional column definitions: (col TYPE, col TYPE, ...)
+        columns = None
+        if self.current_token().type == TokenType.LPAREN:
+            self.eat(TokenType.LPAREN)
+            columns = []
+            col_name = self.eat(TokenType.IDENTIFIER).value
+            col_type = self._parse_type().value
+            columns.append((col_name, col_type))
+            while self.current_token().type == TokenType.COMMA:
+                self.eat(TokenType.COMMA)
+                col_name = self.eat(TokenType.IDENTIFIER).value
+                col_type = self._parse_type().value
+                columns.append((col_name, col_type))
+            self.eat(TokenType.RPAREN)
+
+        self.eat(TokenType.FROM)
+        file_path = self.eat(TokenType.STRING).value
+
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+
+        return ImportStatement(table_name, file_path, columns)

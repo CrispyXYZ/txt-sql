@@ -1,14 +1,16 @@
 from decimal import Decimal
 from typing import Callable
 
+import openpyxl
+
 from . import storage
 from .ast import (
-    DropTable, CreateTable, InsertValues, DeleteStatement, SelectStatement, UpdateStatement,
+    DropTable, CreateTable, InsertValues, DeleteStatement, SelectStatement, UpdateStatement, ImportStatement,
     AggFunc, AggregateColumn,
 )
 from .evaluator import evaluate_where
-from .exceptions import ColumnNotFoundError, TableNotFoundError
-from .types import Types, RowDict
+from .exceptions import ColumnNotFoundError, TableNotFoundError, EngineError
+from .types import Types, RowDict, DataValue
 
 # ---------------------------------------------------------------------------
 # Type map: parser type strings → Types enum
@@ -240,3 +242,61 @@ def execute_update(statement: UpdateStatement) -> int:
     table.update(values, where=where_func)
 
     return affected
+
+
+# ---------------------------------------------------------------------------
+# IMPORT
+# ---------------------------------------------------------------------------
+
+def _infer_types(rows: list[tuple], headers: list[str]) -> dict[str, Types]:
+    """Scan first 100 rows to infer column types for each header."""
+    sample = rows[:100]
+    defs: dict[str, Types] = {}
+    for i, h in enumerate(headers):
+        if not h:
+            continue
+        is_numeric = all(
+            row[i] is None or isinstance(row[i], (int, float))
+            for row in sample
+        )
+        defs[h] = Types.NUMBER if is_numeric else Types.STRING
+    return defs
+
+
+def execute_import(statement: ImportStatement) -> int:
+    """Import an Excel file into a new table."""
+    try:
+        wb = openpyxl.load_workbook(statement.file_path, read_only=True, data_only=True)
+    except FileNotFoundError:
+        raise EngineError(f'File not found: {statement.file_path}')
+
+    ws = wb.active
+    raw_rows: list[tuple] = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    if not raw_rows:
+        raise EngineError('Excel file is empty')
+
+    headers = [str(cell) if cell is not None else '' for cell in raw_rows[0]]
+
+    # Column definitions: user-specified or auto-inferred
+    if statement.columns:
+        col_defs = {name: Types(t) for name, t in statement.columns}
+    else:
+        col_defs = _infer_types(raw_rows[1:], headers)
+
+    storage.create_table(statement.table_name, col_defs)
+    table = storage.get_table(statement.table_name)
+    if table is None:
+        raise EngineError(f'Failed to create table: {statement.table_name}')
+
+    count = 0
+    for row in raw_rows[1:]:
+        values: RowDict = {}
+        for i, h in enumerate(headers):
+            if h:
+                values[h] = row[i] if i < len(row) else None
+        table.insert_values(values)
+        count += 1
+
+    return count

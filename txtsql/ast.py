@@ -150,3 +150,11 @@ class UpdateStatement:
     table_name: str
     set_clauses: list[tuple[str, LiteralValue]]  # [(column, value), ...]
     where_clause: WhereClause | None
+
+
+@dataclass(slots=True, frozen=True)
+class ImportStatement:
+    """IMPORT table_name FROM 'file.xlsx';"""
+    table_name: str
+    file_path: str
+    columns: list[tuple[str, str]] | None  # None = auto-infer types from data
