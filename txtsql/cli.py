@@ -60,6 +60,8 @@ def run_cli() -> None:
 
             if isinstance(result, list):
                 print_table(result)
+            elif isinstance(result, int):
+                print(f"{result} rows affected.")
             elif result is not None:
                 print(result)
             else:

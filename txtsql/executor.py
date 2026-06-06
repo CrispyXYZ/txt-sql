@@ -1,14 +1,18 @@
 from decimal import Decimal
+import csv
 from typing import Callable
+
+import openpyxl
 
 from . import storage
 from .ast import (
-    DropTable, CreateTable, InsertValues, DeleteStatement, SelectStatement, UpdateStatement,
+    DropTable, CreateTable, InsertValues, DeleteStatement, SelectStatement, UpdateStatement, ImportStatement,
+    ShowTables, DescribeTable,
     AggFunc, AggregateColumn,
 )
 from .evaluator import evaluate_where
-from .exceptions import ColumnNotFoundError, TableNotFoundError
-from .types import Types, RowDict
+from .exceptions import ColumnNotFoundError, TableNotFoundError, EngineError, TxtSqlError
+from .types import Types, RowDict, DataValue
 
 # ---------------------------------------------------------------------------
 # Type map: parser type strings → Types enum
@@ -169,7 +173,7 @@ def execute_select(statement: SelectStatement) -> list[RowDict]:
 
     # Non-aggregate path
     if not statement.aggregates:
-        return table.select(
+        result = table.select(
             columns=statement.columns,
             where=where_func,
             order_by=statement.order_by,
@@ -177,42 +181,48 @@ def execute_select(statement: SelectStatement) -> list[RowDict]:
             limit=statement.limit,
             offset=statement.offset,
         )
+    else:
+        # Aggregate path
+        rows = table.select(where=where_func)
 
-    # Aggregate path
-    rows = table.select(where=where_func)
+        # Build aggregation functions
+        aggregations = {agg_col.alias: _make_agg_func(agg_col) for agg_col in statement.aggregates}
 
-    # Build aggregation functions
-    aggregations = {agg_col.alias: _make_agg_func(agg_col) for agg_col in statement.aggregates}
+        # Group and aggregate
+        groups = _group_rows(rows, statement.group_by)
+        result = _apply_aggregations(groups, statement.group_by, aggregations)
 
-    # Group and aggregate
-    groups = _group_rows(rows, statement.group_by)
-    result = _apply_aggregations(groups, statement.group_by, aggregations)
+        # HAVING
+        if statement.having is not None:
+            having_defs: dict[str, Types] = {}
+            if statement.group_by:
+                for gcol in statement.group_by:
+                    if gcol in table.column_types():
+                        having_defs[gcol] = table.column_types()[gcol]
+            for agg_col in statement.aggregates:
+                having_defs[agg_col.alias] = Types.NUMBER
+            having_func = evaluate_where(statement.having.expression, having_defs)
+            result = [r for r in result if having_func(r)]
 
-    # HAVING
-    if statement.having is not None:
-        having_defs: dict[str, Types] = {}
-        if statement.group_by:
-            for gcol in statement.group_by:
-                if gcol in table.column_types():
-                    having_defs[gcol] = table.column_types()[gcol]
-        for agg_col in statement.aggregates:
-            having_defs[agg_col.alias] = Types.NUMBER
-        having_func = evaluate_where(statement.having.expression, having_defs)
-        result = [r for r in result if having_func(r)]
+        # ORDER BY
+        if statement.order_by:
+            for col, desc in reversed(statement.order_by):
+                null_rows = [r for r in result if r.get(col) is None]
+                non_null_rows = [r for r in result if r.get(col) is not None]
+                non_null_rows.sort(key=lambda r, _c=col: r[_c], reverse=desc)
+                result = non_null_rows + null_rows
 
-    # ORDER BY
-    if statement.order_by:
-        for col, desc in reversed(statement.order_by):
-            null_rows = [r for r in result if r.get(col) is None]
-            non_null_rows = [r for r in result if r.get(col) is not None]
-            non_null_rows.sort(key=lambda r, _c=col: r[_c], reverse=desc)
-            result = non_null_rows + null_rows
+        # LIMIT / OFFSET
+        if statement.offset > 0:
+            result = result[statement.offset:]
+        if statement.limit is not None:
+            result = result[:statement.limit]
 
-    # LIMIT / OFFSET
-    if statement.offset > 0:
-        result = result[statement.offset:]
-    if statement.limit is not None:
-        result = result[:statement.limit]
+    # INTO OUTFILE (both paths)
+    if statement.output_file is not None:
+        all_cols = table.column_names()
+        headers = statement.columns if statement.columns else all_cols
+        return _write_output(result, headers, statement.output_file)
 
     return result
 
@@ -240,3 +250,121 @@ def execute_update(statement: UpdateStatement) -> int:
     table.update(values, where=where_func)
 
     return affected
+
+
+# ---------------------------------------------------------------------------
+# System commands
+# ---------------------------------------------------------------------------
+
+def execute_show_tables(statement: ShowTables) -> list[RowDict]:
+    """Return a list of all tables with their row counts."""
+    rows: list[RowDict] = []
+    for name, col_count, defs in storage.list_tables():
+        table = storage.get_table(name)
+        row_count = table.count_rows() if table else 0
+        col_names = ', '.join(defs.keys())
+        rows.append({'Table': name, 'Columns': col_names, 'Rows': row_count})
+    return rows
+
+
+def execute_describe(statement: DescribeTable) -> list[RowDict]:
+    """Return column definitions for a specific table."""
+    table = storage.get_table(statement.table_name)
+    if table is None:
+        raise TableNotFoundError(f'Table does not exist: {statement.table_name}')
+    rows: list[RowDict] = []
+    for col_name, col_type in table.defs.items():
+        rows.append({'Column': col_name, 'Type': col_type.value})
+    rows.append({'Column': '__rows__', 'Type': str(table.count_rows())})
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# EXPORT helper
+# ---------------------------------------------------------------------------
+
+def _write_output(rows: list[RowDict], headers: list[str], filepath: str) -> int:
+    """Write query results to file. Format determined by extension."""
+    ext = filepath.rsplit('.', 1)[-1].lower() if '.' in filepath else ''
+
+    if ext == 'xlsx':
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(headers)
+        for row in rows:
+            ws.append([_cell_value(row.get(h)) for h in headers])
+        wb.save(filepath)
+    else:
+        delim = '\t' if ext == 'tsv' else ','
+        with open(filepath, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f, delimiter=delim, quoting=csv.QUOTE_NONNUMERIC)
+            writer.writerow(headers)
+            for row in rows:
+                writer.writerow([_cell_value(row.get(h)) for h in headers])
+
+    return len(rows)
+
+
+def _cell_value(value: object) -> object:
+    """Convert data value to a format suitable for export."""
+    if value is None:
+        return ''
+    return value
+
+
+# ---------------------------------------------------------------------------
+# IMPORT
+# ---------------------------------------------------------------------------
+
+def _infer_types(rows: list[tuple], headers: list[str]) -> dict[str, Types]:
+    """Scan first 100 rows to infer column types for each header."""
+    sample = rows[:100]
+    defs: dict[str, Types] = {}
+    for i, h in enumerate(headers):
+        if not h:
+            continue
+        is_numeric = all(
+            row[i] is None or isinstance(row[i], (int, float))
+            for row in sample
+        )
+        defs[h] = Types.NUMBER if is_numeric else Types.STRING
+    return defs
+
+
+def execute_import(statement: ImportStatement) -> int:
+    """Import an Excel file into a new table."""
+    try:
+        wb = openpyxl.load_workbook(statement.file_path, read_only=True, data_only=True)
+    except FileNotFoundError:
+        raise EngineError(f'File not found: {statement.file_path}')
+
+    ws = wb.active
+    raw_rows: list[tuple] = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    if not raw_rows:
+        raise EngineError('Excel file is empty')
+
+    headers = [str(cell) if cell is not None else '' for cell in raw_rows[0]]
+
+    # Column definitions: user-specified or auto-inferred
+    if statement.columns:
+        col_defs = {name: Types(t) for name, t in statement.columns}
+    else:
+        col_defs = _infer_types(raw_rows[1:], headers)
+
+    storage.create_table(statement.table_name, col_defs)
+    table = storage.get_table(statement.table_name)
+    if table is None:
+        raise EngineError(f'Failed to create table: {statement.table_name}')
+
+    count = 0
+    for row in raw_rows[1:]:
+        values: RowDict = {}
+        for i, h in enumerate(headers):
+            if h:
+                values[h] = row[i] if i < len(row) else None
+        table.insert_values(values)
+        count += 1
+
+    return count

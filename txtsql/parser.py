@@ -4,7 +4,8 @@ from .ast import (
     NullCheckExpression, ConditionExpression, LogicalExpression,
     WhereClause, AggregateColumn,
     CreateTable, DropTable, InsertValues,
-    DeleteStatement, SelectStatement, UpdateStatement,
+    DeleteStatement, SelectStatement, UpdateStatement, ImportStatement,
+    ShowTables, DescribeTable,
 )
 from .exceptions import SqlSyntaxError
 from .lexer import Token, TokenType
@@ -33,7 +34,7 @@ class Parser:
             return self.tokens[self.pos + 1].type
         return TokenType.EOF
 
-    def parse(self) -> CreateTable | DropTable | InsertValues | DeleteStatement | SelectStatement | UpdateStatement:
+    def parse(self) -> CreateTable | DropTable | InsertValues | DeleteStatement | SelectStatement | UpdateStatement | ImportStatement | ShowTables | DescribeTable:
         token = self.current_token()
         match token.type:
             case TokenType.CREATE:
@@ -48,6 +49,12 @@ class Parser:
                 return self.select_statement()
             case TokenType.UPDATE:
                 return self.update_statement()
+            case TokenType.IMPORT:
+                return self.import_statement()
+            case TokenType.SHOW:
+                return self.show_tables()
+            case TokenType.DESCRIBE:
+                return self.describe()
             case _:
                 raise SqlSyntaxError(f'Unexpected statement: {token.type}')
 
@@ -373,8 +380,15 @@ class Parser:
                         f'when used with aggregate functions'
                     )
 
+        # Optional INTO OUTFILE
+        output_file: str | None = None
+        if self.current_token().type == TokenType.INTO:
+            self.eat(TokenType.INTO)
+            self.eat(TokenType.OUTFILE)
+            output_file = self.eat(TokenType.STRING).value
+
         return SelectStatement(table_name, columns, aggregates, distinct,
-                               where_clause, group_by, having, order_by, limit, offset)
+                               where_clause, group_by, having, order_by, limit, offset, output_file)
 
     _AGG_FUNC_TOKEN_MAP = {
         TokenType.COUNT: AggFunc.COUNT,
@@ -447,3 +461,47 @@ class Parser:
             self.eat(TokenType.SEMICOLON)
 
         return UpdateStatement(table_name, set_clauses, where_clause)
+
+    def import_statement(self) -> ImportStatement:
+        """Parse IMPORT table_name [(col TYPE, ...)] FROM 'file_path';"""
+        self.eat(TokenType.IMPORT)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+
+        # Optional column definitions: (col TYPE, col TYPE, ...)
+        columns = None
+        if self.current_token().type == TokenType.LPAREN:
+            self.eat(TokenType.LPAREN)
+            columns = []
+            col_name = self.eat(TokenType.IDENTIFIER).value
+            col_type = self._parse_type().value
+            columns.append((col_name, col_type))
+            while self.current_token().type == TokenType.COMMA:
+                self.eat(TokenType.COMMA)
+                col_name = self.eat(TokenType.IDENTIFIER).value
+                col_type = self._parse_type().value
+                columns.append((col_name, col_type))
+            self.eat(TokenType.RPAREN)
+
+        self.eat(TokenType.FROM)
+        file_path = self.eat(TokenType.STRING).value
+
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+
+        return ImportStatement(table_name, file_path, columns)
+
+    def show_tables(self) -> ShowTables:
+        """Parse SHOW TABLES;"""
+        self.eat(TokenType.SHOW)
+        self.eat(TokenType.TABLES)
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+        return ShowTables()
+
+    def describe(self) -> DescribeTable:
+        """Parse DESCRIBE table_name;"""
+        self.eat(TokenType.DESCRIBE)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+        return DescribeTable(table_name)
