@@ -1,129 +1,13 @@
-from dataclasses import dataclass
-from enum import Enum
-from typing import Any
-
+from .ast import (
+    LogicalOp, AggFunc, ComparisonOp, LiteralValue,
+    Expression, LiteralExpression, ColumnExpression,
+    NullCheckExpression, ConditionExpression, LogicalExpression,
+    WhereClause, AggregateColumn,
+    CreateTable, DropTable, InsertValues,
+    DeleteStatement, SelectStatement, UpdateStatement,
+)
 from .exceptions import SqlSyntaxError
 from .lexer import Token, TokenType
-
-
-@dataclass(slots=True, frozen=True)
-class DropTable:
-    table_name: str
-
-
-@dataclass(slots=True, frozen=True)
-class CreateTable:
-    table_name: str
-    columns: list[tuple[str, str]]
-
-
-@dataclass(slots=True, frozen=True)
-class InsertValues:
-    table_name: str
-    columns: list[str] | None
-    values: list[list[Any]]
-
-
-class LogicalOp(Enum):
-    AND = 'and'
-    OR = 'or'
-
-
-class AggFunc(Enum):
-    COUNT = 'COUNT'
-    SUM = 'SUM'
-    AVG = 'AVG'
-    MIN = 'MIN'
-    MAX = 'MAX'
-
-
-@dataclass(slots=True, frozen=True)
-class AggregateColumn:
-    func: AggFunc
-    column: str | None  # None for COUNT(*)
-    alias: str
-
-
-class ComparisonOp(Enum):
-    EQ = '='
-    NE = '<>'
-    GT = '>'
-    LT = '<'
-    GE = '>='
-    LE = '<='
-
-
-class Expression:
-    """Base class: expression"""
-    pass
-
-
-@dataclass
-class LiteralExpression(Expression):
-    """Literal expression: 1, 'hello', NULL, TRUE, FALSE"""
-    value: Any
-
-
-@dataclass
-class ColumnExpression(Expression):
-    """Column name expression: age, name"""
-    column_name: str
-
-
-@dataclass
-class NullCheckExpression(Expression):
-    """NULL check: column IS [NOT] NULL"""
-    column: ColumnExpression
-    is_null: bool  # True for IS NULL, False for IS NOT NULL
-
-
-@dataclass
-class ConditionExpression(Expression):
-    """Condition expression: column op literal (e.g., age > 18)"""
-    column: ColumnExpression
-    op: ComparisonOp
-    literal: LiteralExpression
-
-
-@dataclass
-class LogicalExpression(Expression):
-    """Logical expression: left AND/OR right"""
-    left: Expression
-    op: LogicalOp
-    right: Expression
-
-
-@dataclass
-class WhereClause:
-    """WHERE clause wrapper"""
-    expression: Expression
-
-
-@dataclass(slots=True, frozen=True)
-class DeleteStatement:
-    table_name: str
-    where_clause: WhereClause | None
-
-
-@dataclass(slots=True, frozen=True)
-class SelectStatement:
-    table_name: str
-    columns: list[str] | None  # None means SELECT *
-    aggregates: list[AggregateColumn]  # aggregate expressions; empty list for non-aggregate queries
-    distinct: bool
-    where_clause: WhereClause | None
-    group_by: list[str] | None
-    having: WhereClause | None
-    order_by: list[tuple[str, bool]] | None  # (column, desc)
-    limit: int | None
-    offset: int
-
-
-@dataclass(slots=True, frozen=True)
-class UpdateStatement:
-    table_name: str
-    set_clauses: list[tuple[str, Any]]  # [(column, value), ...]
-    where_clause: WhereClause | None
 
 
 class Parser:
@@ -149,7 +33,7 @@ class Parser:
             return self.tokens[self.pos + 1].type
         return TokenType.EOF
 
-    def parse(self) -> Any:
+    def parse(self) -> CreateTable | DropTable | InsertValues | DeleteStatement | SelectStatement | UpdateStatement:
         token = self.current_token()
         match token.type:
             case TokenType.CREATE:
@@ -247,13 +131,16 @@ class Parser:
             self.eat(TokenType.SEMICOLON)
         return InsertValues(table_name, columns, all_values)
 
-    # Expression parsing methods
+    # ------------------------------------------------------------------
+    # Expression parsing
+    # ------------------------------------------------------------------
+
     def parse_expression(self) -> Expression:
-        """Parse expression (entry point)"""
+        """Parse expression (entry point)."""
         return self.parse_or()
 
     def parse_or(self) -> Expression:
-        """Parse OR expression (AND has higher precedence than OR)"""
+        """Parse OR expression (AND has higher precedence)."""
         left = self.parse_and()
         while self.current_token().type == TokenType.OR:
             op = LogicalOp.OR
@@ -263,7 +150,7 @@ class Parser:
         return left
 
     def parse_and(self) -> Expression:
-        """Parse AND expression"""
+        """Parse AND expression."""
         left = self.parse_condition()
         while self.current_token().type == TokenType.AND:
             op = LogicalOp.AND
@@ -273,32 +160,28 @@ class Parser:
         return left
 
     def parse_condition(self) -> Expression:
-        """Parse condition (comparison expression or parenthesized expression)"""
+        """Parse condition (comparison, NULL check, or parenthesized expression)."""
         token = self.current_token()
 
-        # Parenthesized expression
         if token.type == TokenType.LPAREN:
             self.eat(TokenType.LPAREN)
             expr = self.parse_expression()
             self.eat(TokenType.RPAREN)
             return expr
 
-        # NULL check: column IS [NOT] NULL
         if token.type == TokenType.IDENTIFIER and self.peek() == TokenType.IS:
             return self._parse_null_check()
 
-        # Comparison expression: column_name op literal
         if token.type == TokenType.IDENTIFIER and self._is_comparison_op(self.peek()):
             return self._parse_comparison()
 
         raise SqlSyntaxError(f"Unexpected token: {token.type} at line {token.line}, column {token.column}")
 
     def _parse_null_check(self) -> Expression:
-        """Parse column IS [NOT] NULL"""
+        """Parse column IS [NOT] NULL."""
         column = self.eat(TokenType.IDENTIFIER).value
         self.eat(TokenType.IS)
 
-        # NOT NULL
         is_not = False
         if self.current_token().type == TokenType.NOT:
             self.eat(TokenType.NOT)
@@ -308,11 +191,11 @@ class Parser:
 
         return NullCheckExpression(
             ColumnExpression(column),
-            is_null=not is_not  # True means IS NULL, False means IS NOT NULL
+            is_null=not is_not,
         )
 
     def _parse_comparison(self) -> Expression:
-        """Parse column_name op literal"""
+        """Parse column_name op literal."""
         column_token = self.eat(TokenType.IDENTIFIER)
         column_name = column_token.value
 
@@ -356,51 +239,49 @@ class Parser:
         else:
             raise SqlSyntaxError(f"Expected literal value but got {literal_token.type}")
 
-        return ConditionExpression(
-            ColumnExpression(column_name),
-            op,
-            literal
-        )
+        return ConditionExpression(ColumnExpression(column_name), op, literal)
 
-    def _is_comparison_op(self, token_type: TokenType) -> bool:
-        """Determine if token is a comparison operator"""
+    @staticmethod
+    def _is_comparison_op(token_type: TokenType) -> bool:
+        """Determine if token is a comparison operator."""
         return token_type in [
             TokenType.EQ, TokenType.NE, TokenType.GT, TokenType.LT,
-            TokenType.GE, TokenType.LE
+            TokenType.GE, TokenType.LE,
         ]
+
+    # ------------------------------------------------------------------
+    # Statement parsing
+    # ------------------------------------------------------------------
 
     def delete_statement(self) -> DeleteStatement:
         """Parse DELETE FROM table_name WHERE condition;"""
         self.eat(TokenType.DELETE)
         self.eat(TokenType.FROM)
 
-        # Table name
         table_name = self.eat(TokenType.IDENTIFIER).value
 
-        # WHERE clause (optional)
         where_clause = None
         if self.current_token().type == TokenType.WHERE:
             self.eat(TokenType.WHERE)
             expression = self.parse_expression()
             where_clause = WhereClause(expression)
 
-        # Semicolon optional
         if self.current_token().type == TokenType.SEMICOLON:
             self.eat(TokenType.SEMICOLON)
 
         return DeleteStatement(table_name, where_clause)
 
     def select_statement(self) -> SelectStatement:
-        """Parse SELECT [DISTINCT] col1, agg_func(col) AS alias, * FROM table [WHERE expr] [GROUP BY col, ...] [HAVING expr] [ORDER BY col [ASC|DESC], ...] [LIMIT n] [OFFSET n];"""
+        """Parse SELECT [DISTINCT] col1, agg(col) AS alias, * FROM table
+           [WHERE expr] [GROUP BY col, ...] [HAVING expr]
+           [ORDER BY col [ASC|DESC], ...] [LIMIT n] [OFFSET n];"""
         self.eat(TokenType.SELECT)
 
-        # Optional DISTINCT
         distinct = False
         if self.current_token().type == TokenType.DISTINCT:
             self.eat(TokenType.DISTINCT)
             distinct = True
 
-        # Column list or *
         columns: list[str] | None
         aggregates: list[AggregateColumn] = []
         if self.current_token().type == TokenType.STAR:
@@ -478,6 +359,7 @@ class Parser:
         if self.current_token().type == TokenType.SEMICOLON:
             self.eat(TokenType.SEMICOLON)
 
+        # Validation: aggregates + plain columns require GROUP BY
         if aggregates:
             if group_by is None:
                 if columns:
@@ -488,10 +370,12 @@ class Parser:
                 non_grouped = [c for c in columns if c not in group_by]
                 if non_grouped:
                     raise SqlSyntaxError(
-                        f'Column "{non_grouped[0]}" must appear in GROUP BY clause when used with aggregate functions'
+                        f'Column "{non_grouped[0]}" must appear in GROUP BY clause '
+                        f'when used with aggregate functions'
                     )
 
-        return SelectStatement(table_name, columns, aggregates, distinct, where_clause, group_by, having, order_by, limit, offset)
+        return SelectStatement(table_name, columns, aggregates, distinct,
+                               where_clause, group_by, having, order_by, limit, offset)
 
     _AGG_FUNC_TOKEN_MAP = {
         TokenType.COUNT: AggFunc.COUNT,
@@ -502,7 +386,7 @@ class Parser:
     }
 
     def _parse_select_item(self, columns: list[str], aggregates: list[AggregateColumn]) -> None:
-        """Parse a single SELECT list item: either a plain column name or an aggregate function call."""
+        """Parse a SELECT list item: plain column or aggregate call."""
         token = self.current_token()
         if token.type in self._AGG_FUNC_TOKEN_MAP:
             func = self._AGG_FUNC_TOKEN_MAP[token.type]
@@ -520,8 +404,8 @@ class Parser:
         else:
             columns.append(self.eat(TokenType.IDENTIFIER).value)
 
-    def _parse_literal_value(self) -> Any:
-        """Parse a literal value token (STRING, NUMBER, BINARY, NULL, TRUE, FALSE)."""
+    def _parse_literal_value(self) -> LiteralValue:
+        """Parse a literal value (STRING, NUMBER, BINARY, NULL, TRUE, FALSE)."""
         val_token = self.current_token()
         if val_token.type in (TokenType.STRING, TokenType.NUMBER, TokenType.BINARY):
             self.pos += 1
@@ -544,8 +428,7 @@ class Parser:
         table_name = self.eat(TokenType.IDENTIFIER).value
         self.eat(TokenType.SET)
 
-        # Parse SET clauses
-        set_clauses: list[tuple[str, Any]] = []
+        set_clauses: list[tuple[str, LiteralValue]] = []
         col = self.eat(TokenType.IDENTIFIER).value
         self.eat(TokenType.EQ)
         set_clauses.append((col, self._parse_literal_value()))
@@ -556,7 +439,6 @@ class Parser:
             self.eat(TokenType.EQ)
             set_clauses.append((col, self._parse_literal_value()))
 
-        # Optional WHERE
         where_clause = None
         if self.current_token().type == TokenType.WHERE:
             self.eat(TokenType.WHERE)

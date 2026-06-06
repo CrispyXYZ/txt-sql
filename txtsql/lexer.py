@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
 
 from .exceptions import SqlSyntaxError
 
@@ -68,10 +67,13 @@ class TokenType(StrEnum):
     IDENTIFIER = 'IDENTIFIER'
 
 
+type TokenValue = str | Decimal | bytes | None
+
+
 @dataclass(frozen=True, slots=True)
 class Token:
     type: TokenType
-    value: Any
+    value: TokenValue
     line: int
     column: int
 

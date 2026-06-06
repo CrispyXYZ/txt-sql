@@ -1,30 +1,28 @@
 from collections.abc import Callable
 from decimal import Decimal
-from typing import Any
 
-from .parser import (
+from .ast import (
     Expression, ColumnExpression, NullCheckExpression,
-    ConditionExpression, LogicalExpression, LogicalOp, ComparisonOp
+    ConditionExpression, LogicalExpression, LogicalOp, ComparisonOp,
 )
-from .storage import RowDict
-from .types import Types
+from .exceptions import ColumnNotFoundError, TypeMismatchError
+from .types import Types, RowDict
 
 
 def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Callable[[RowDict], bool]:
     """
-    Evaluate AST expression to bool function.
-    :param expression: AST expression
-    :param table_defs: Table defs {col_name: Types}
-    :return: Function (row_dict) -> bool
+    Compile an AST expression into a row predicate.
+    :param expression: AST expression tree
+    :param table_defs: {col_name: Types}
+    :return: callable (row_dict) -> bool
     """
 
     def eval_expr(expr: Expression) -> Callable[[RowDict], bool]:
-        """Internal recursive evaluation function"""
         match expr:
             case ColumnExpression(column_name):
                 def _column(row: RowDict) -> bool:
                     if column_name not in row:
-                        raise ValueError(f'Column does not exist: {column_name}')
+                        raise ColumnNotFoundError(f'Column does not exist: {column_name}')
                     return _to_bool(row[column_name])
                 return _column
 
@@ -33,9 +31,8 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Call
 
                 def _null_check(row: RowDict) -> bool:
                     if col_name not in row:
-                        raise ValueError(f'Column does not exist: {col_name}')
-                    value = row[col_name]
-                    return (value is None) == is_null
+                        raise ColumnNotFoundError(f'Column does not exist: {col_name}')
+                    return (row[col_name] is None) == is_null
                 return _null_check
 
             case ConditionExpression(col_expr, op, literal_expr):
@@ -43,22 +40,20 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Call
                 literal_value = literal_expr.value
 
                 if col_name not in table_defs:
-                    raise ValueError(f'Column does not exist: {col_name}')
+                    raise ColumnNotFoundError(f'Column does not exist: {col_name}')
 
                 col_type = table_defs[col_name]
                 if not _check_type_compatibility(literal_value, col_type):
-                    literal_type = type(literal_value).__name__
-                    raise ValueError(
-                        f'Type mismatch in WHERE clause: attempting to compare '
-                        f'column "{col_name}" of type {col_type.value} with value '
-                        f'"{literal_value}" of incompatible type {literal_type}'
+                    raise TypeMismatchError(
+                        f'Type mismatch in WHERE clause: column "{col_name}" '
+                        f'of type {col_type.value} is incompatible with '
+                        f'{type(literal_value).__name__} value'
                     )
 
                 def _condition(row: RowDict) -> bool:
                     if col_name not in row:
-                        raise ValueError(f'Column does not exist: {col_name}')
-                    col_value = row[col_name]
-                    return _compare(col_value, literal_value, op)
+                        raise ColumnNotFoundError(f'Column does not exist: {col_name}')
+                    return _compare(row[col_name], literal_value, op)
                 return _condition
 
             case LogicalExpression(left, op, right):
@@ -68,10 +63,7 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Call
                 def _logical(row: RowDict) -> bool:
                     left_val = eval_left(row)
                     right_val = eval_right(row)
-                    if op == LogicalOp.AND:
-                        return left_val and right_val
-                    else:
-                        return left_val or right_val
+                    return left_val and right_val if op == LogicalOp.AND else left_val or right_val
                 return _logical
 
             case _:
@@ -80,8 +72,8 @@ def evaluate_where(expression: Expression, table_defs: dict[str, Types]) -> Call
     return eval_expr(expression)
 
 
-def _to_bool(value: Any) -> bool:
-    """Convert basic types to boolean values"""
+def _to_bool(value: object) -> bool:
+    """Convert arbitrary value to boolean for WHERE filtering."""
     if value is None:
         return False
     if isinstance(value, bool):
@@ -93,8 +85,8 @@ def _to_bool(value: Any) -> bool:
     return bool(value)
 
 
-def _check_type_compatibility(value: Any, expected_type: Types) -> bool:
-    """Check if literal type is compatible with column type"""
+def _check_type_compatibility(value: object, expected_type: Types) -> bool:
+    """Check if a literal value is compatible with a column type."""
     if value is None:
         return True
     match expected_type:
@@ -107,11 +99,13 @@ def _check_type_compatibility(value: Any, expected_type: Types) -> bool:
     return False
 
 
-def _compare(left: Any, right: Any, op: ComparisonOp) -> bool:
-    """Execute comparison operations, handling NULL and type conversion"""
+def _compare(left: object, right: object, op: ComparisonOp) -> bool:
+    """Execute comparison, handling NULL and type coercion."""
+    # SQL standard: any comparison with NULL is UNKNOWN → False
     if left is None or right is None:
         return False
 
+    # Coerce numeric types
     if isinstance(left, (int, float, Decimal)) and isinstance(right, (int, float, Decimal)):
         l_val = Decimal(left)
         r_val = Decimal(right)
@@ -127,8 +121,9 @@ def _compare(left: Any, right: Any, op: ComparisonOp) -> bool:
         elif op == ComparisonOp.NE:
             return True
         else:
-            raise ValueError(
-                f"Cannot compare values of different types: {type(left).__name__} and {type(right).__name__}"
+            raise TypeMismatchError(
+                f"Cannot compare values of different types: "
+                f"{type(left).__name__} and {type(right).__name__}"
             )
 
     match op:
