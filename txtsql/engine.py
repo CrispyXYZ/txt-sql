@@ -1,12 +1,12 @@
-from typing import Any
-
+from .ast import CreateTable, DeleteStatement, DropTable, InsertValues, SelectStatement, UpdateStatement
 from .exceptions import EngineError
-from .executor import execute_drop, execute_create, execute_insert
+from .executor import execute_drop, execute_create, execute_insert, execute_delete, execute_select, execute_update
 from .lexer import Lexer
-from .parser import Parser, DropTable, CreateTable, InsertValues
+from .parser import Parser
+from .types import RowDict
 
 
-def execute_sql(sql: str) -> Any:
+def execute_sql(sql: str) -> list[RowDict] | int | None:
     lexer = Lexer(sql)
     tokens = lexer.tokenize()
     parser = Parser(tokens)
@@ -22,5 +22,11 @@ def execute_sql(sql: str) -> Any:
         case InsertValues():
             execute_insert(statement)
             return None
+        case DeleteStatement():
+            return execute_delete(statement)
+        case SelectStatement():
+            return execute_select(statement)
+        case UpdateStatement():
+            return execute_update(statement)
         case _:
             raise EngineError(f'Unsupported statement type: {type(statement)}')

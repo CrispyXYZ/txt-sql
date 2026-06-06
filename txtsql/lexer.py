@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
 
 from .exceptions import SqlSyntaxError
 
@@ -15,7 +14,44 @@ class TokenType(StrEnum):
     VALUES = 'VALUES'
     TYPE_STRING = 'STRING'
     TYPE_NUMBER = 'NUMBER'
-    TYPE_BINARY = 'BINARY'
+
+    SELECT = 'SELECT'
+    DISTINCT = 'DISTINCT'
+    STAR = 'STAR'
+    UPDATE = 'UPDATE'
+    SET = 'SET'
+    ORDER = 'ORDER'
+    GROUP = 'GROUP'
+    BY = 'BY'
+    HAVING = 'HAVING'
+    ASC = 'ASC'
+    DESC = 'DESC'
+    LIMIT = 'LIMIT'
+    OFFSET = 'OFFSET'
+    AS = 'AS'
+    COUNT = 'COUNT'
+    SUM = 'SUM'
+    AVG = 'AVG'
+    MIN = 'MIN'
+    MAX = 'MAX'
+
+    DELETE = 'DELETE'
+    FROM = 'FROM'
+    WHERE = 'WHERE'
+    AND = 'AND'
+    OR = 'OR'
+    NOT = 'NOT'
+    IS = 'IS'
+    TRUE = 'TRUE'
+    FALSE = 'FALSE'
+    NULL = 'NULL'
+
+    EQ = '='
+    NE = '<>'
+    GT = '>'
+    LT = '<'
+    GE = '>='
+    LE = '<='
 
     SEMICOLON = 'SEMICOLON'
     COMMA = 'COMMA'
@@ -26,14 +62,16 @@ class TokenType(StrEnum):
 
     STRING = 'STRING'
     NUMBER = 'NUMBER'
-    BINARY = 'BINARY'
     IDENTIFIER = 'IDENTIFIER'
+
+
+type TokenValue = str | Decimal | None
 
 
 @dataclass(frozen=True, slots=True)
 class Token:
     type: TokenType
-    value: Any
+    value: TokenValue
     line: int
     column: int
 
@@ -74,6 +112,13 @@ class Lexer:
         while self.current_char() is not None and self.current_char().isdigit():
             num_str += self.current_char()
             self.advance()
+        # Support decimal point (e.g. 3.14) - require at least one digit after the point
+        if self.current_char() == '.' and self.peek() is not None and self.peek().isdigit():
+            num_str += '.'
+            self.advance()
+            while self.current_char() is not None and self.current_char().isdigit():
+                num_str += self.current_char()
+                self.advance()
         return Token(TokenType.NUMBER, Decimal(num_str), self.line, start_col)
 
     def read_string(self) -> Token:
@@ -86,21 +131,6 @@ class Lexer:
         if self.current_char() == "'":
             self.advance()
         return Token(TokenType.STRING, string_str, self.line, start_col)
-
-    def read_binary(self) -> Token:
-        start_col = self.column
-
-        self.advance()
-        self.advance()
-
-        hex_chars = ''
-        while self.current_char() is not None and self.current_char() in '0123456789abcdefABCDEF':
-            hex_chars += self.current_char()
-            self.advance()
-
-        data = bytes.fromhex(hex_chars)
-
-        return Token(TokenType.BINARY, data, self.line, start_col)
 
     def read_identifier_or_keyword(self) -> Token:
         start_col = self.column
@@ -122,14 +152,68 @@ class Lexer:
                 token_type = TokenType.INTO
             case 'VALUES':
                 token_type = TokenType.VALUES
+            case 'SELECT':
+                token_type = TokenType.SELECT
+            case 'DISTINCT':
+                token_type = TokenType.DISTINCT
+            case 'UPDATE':
+                token_type = TokenType.UPDATE
+            case 'SET':
+                token_type = TokenType.SET
+            case 'ORDER':
+                token_type = TokenType.ORDER
+            case 'GROUP':
+                token_type = TokenType.GROUP
+            case 'BY':
+                token_type = TokenType.BY
+            case 'HAVING':
+                token_type = TokenType.HAVING
+            case 'AS':
+                token_type = TokenType.AS
+            case 'COUNT':
+                token_type = TokenType.COUNT
+            case 'SUM':
+                token_type = TokenType.SUM
+            case 'AVG':
+                token_type = TokenType.AVG
+            case 'MIN':
+                token_type = TokenType.MIN
+            case 'MAX':
+                token_type = TokenType.MAX
+            case 'ASC':
+                token_type = TokenType.ASC
+            case 'DESC':
+                token_type = TokenType.DESC
+            case 'LIMIT':
+                token_type = TokenType.LIMIT
+            case 'OFFSET':
+                token_type = TokenType.OFFSET
+            case 'DELETE':
+                token_type = TokenType.DELETE
+            case 'FROM':
+                token_type = TokenType.FROM
+            case 'WHERE':
+                token_type = TokenType.WHERE
+            case 'AND':
+                token_type = TokenType.AND
+            case 'OR':
+                token_type = TokenType.OR
+            case 'NOT':
+                token_type = TokenType.NOT
+            case 'IS':
+                token_type = TokenType.IS
+            case 'TRUE':
+                token_type = TokenType.TRUE
+            case 'FALSE':
+                token_type = TokenType.FALSE
+            case 'NULL':
+                token_type = TokenType.NULL
             case 'STRING' | 'VARCHAR':
                 token_type = TokenType.STRING
                 identifier = 'STRING'
             case 'NUMBER' | 'DECIMAL':
                 token_type = TokenType.NUMBER
                 identifier = 'NUMBER'
-            case 'BINARY':
-                token_type = TokenType.BINARY
             case _:
                 token_type = TokenType.IDENTIFIER
         return Token(token_type, identifier, self.line, start_col)
@@ -153,12 +237,37 @@ class Lexer:
             case ')':
                 self.advance()
                 return Token(TokenType.RPAREN, ')', self.line, self.column - 1)
+            case '*':
+                self.advance()
+                return Token(TokenType.STAR, '*', self.line, self.column - 1)
+            case '=':
+                self.advance()
+                return Token(TokenType.EQ, '=', self.line, self.column - 1)
+            case '<':
+                next_char = self.peek()
+                if next_char == '>':  # <>
+                    self.advance()
+                    self.advance()
+                    return Token(TokenType.NE, '<>', self.line, self.column - 2)
+                elif next_char == '=':  # <=
+                    self.advance()
+                    self.advance()
+                    return Token(TokenType.LE, '<=', self.line, self.column - 2)
+                else:  # <
+                    self.advance()
+                    return Token(TokenType.LT, '<', self.line, self.column - 1)
+            case '>':
+                next_char = self.peek()
+                if next_char == '=':  # >=
+                    self.advance()
+                    self.advance()
+                    return Token(TokenType.GE, '>=', self.line, self.column - 2)
+                else:  # >
+                    self.advance()
+                    return Token(TokenType.GT, '>', self.line, self.column - 1)
             case _:
                 if ch.isdigit():
-                    if ch == '0' and self.peek() in ('x', 'X'):
-                        return self.read_binary()
-                    else:
-                        return self.read_number()
+                    return self.read_number()
                 if ch == "'":
                     return self.read_string()
                 if ch.isalpha() or ch == '_':
