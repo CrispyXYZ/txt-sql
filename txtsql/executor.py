@@ -3,6 +3,7 @@ import csv
 from typing import Callable
 
 import openpyxl
+from openpyxl.utils.exceptions import InvalidFileException
 
 from . import storage
 from .ast import (
@@ -337,9 +338,20 @@ def execute_import(statement: ImportStatement) -> int:
         wb = openpyxl.load_workbook(statement.file_path, read_only=True, data_only=True)
     except FileNotFoundError:
         raise EngineError(f'File not found: {statement.file_path}')
+    except InvalidFileException:
+        raise EngineError(f'Invalid file type: {statement.file_path}')
 
     ws = wb.active
-    raw_rows: list[tuple] = list(ws.iter_rows(values_only=True))
+    raw_rows: list[tuple] = []
+    empty_streak = 0
+    for row in ws.iter_rows(values_only=True):
+        if any(cell is not None for cell in row):
+            raw_rows.append(row)
+            empty_streak = 0
+        elif raw_rows:
+            empty_streak += 1
+            if empty_streak > 10:
+                break
     wb.close()
 
     if not raw_rows:
