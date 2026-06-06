@@ -1,4 +1,5 @@
 from decimal import Decimal
+import csv
 from typing import Callable
 
 import openpyxl
@@ -171,7 +172,7 @@ def execute_select(statement: SelectStatement) -> list[RowDict]:
 
     # Non-aggregate path
     if not statement.aggregates:
-        return table.select(
+        result = table.select(
             columns=statement.columns,
             where=where_func,
             order_by=statement.order_by,
@@ -179,42 +180,48 @@ def execute_select(statement: SelectStatement) -> list[RowDict]:
             limit=statement.limit,
             offset=statement.offset,
         )
+    else:
+        # Aggregate path
+        rows = table.select(where=where_func)
 
-    # Aggregate path
-    rows = table.select(where=where_func)
+        # Build aggregation functions
+        aggregations = {agg_col.alias: _make_agg_func(agg_col) for agg_col in statement.aggregates}
 
-    # Build aggregation functions
-    aggregations = {agg_col.alias: _make_agg_func(agg_col) for agg_col in statement.aggregates}
+        # Group and aggregate
+        groups = _group_rows(rows, statement.group_by)
+        result = _apply_aggregations(groups, statement.group_by, aggregations)
 
-    # Group and aggregate
-    groups = _group_rows(rows, statement.group_by)
-    result = _apply_aggregations(groups, statement.group_by, aggregations)
+        # HAVING
+        if statement.having is not None:
+            having_defs: dict[str, Types] = {}
+            if statement.group_by:
+                for gcol in statement.group_by:
+                    if gcol in table.column_types():
+                        having_defs[gcol] = table.column_types()[gcol]
+            for agg_col in statement.aggregates:
+                having_defs[agg_col.alias] = Types.NUMBER
+            having_func = evaluate_where(statement.having.expression, having_defs)
+            result = [r for r in result if having_func(r)]
 
-    # HAVING
-    if statement.having is not None:
-        having_defs: dict[str, Types] = {}
-        if statement.group_by:
-            for gcol in statement.group_by:
-                if gcol in table.column_types():
-                    having_defs[gcol] = table.column_types()[gcol]
-        for agg_col in statement.aggregates:
-            having_defs[agg_col.alias] = Types.NUMBER
-        having_func = evaluate_where(statement.having.expression, having_defs)
-        result = [r for r in result if having_func(r)]
+        # ORDER BY
+        if statement.order_by:
+            for col, desc in reversed(statement.order_by):
+                null_rows = [r for r in result if r.get(col) is None]
+                non_null_rows = [r for r in result if r.get(col) is not None]
+                non_null_rows.sort(key=lambda r, _c=col: r[_c], reverse=desc)
+                result = non_null_rows + null_rows
 
-    # ORDER BY
-    if statement.order_by:
-        for col, desc in reversed(statement.order_by):
-            null_rows = [r for r in result if r.get(col) is None]
-            non_null_rows = [r for r in result if r.get(col) is not None]
-            non_null_rows.sort(key=lambda r, _c=col: r[_c], reverse=desc)
-            result = non_null_rows + null_rows
+        # LIMIT / OFFSET
+        if statement.offset > 0:
+            result = result[statement.offset:]
+        if statement.limit is not None:
+            result = result[:statement.limit]
 
-    # LIMIT / OFFSET
-    if statement.offset > 0:
-        result = result[statement.offset:]
-    if statement.limit is not None:
-        result = result[:statement.limit]
+    # INTO OUTFILE (both paths)
+    if statement.output_file is not None:
+        all_cols = table.column_names()
+        headers = statement.columns if statement.columns else all_cols
+        return _write_output(result, headers, statement.output_file)
 
     return result
 
@@ -242,6 +249,39 @@ def execute_update(statement: UpdateStatement) -> int:
     table.update(values, where=where_func)
 
     return affected
+
+
+# ---------------------------------------------------------------------------
+# EXPORT helper
+# ---------------------------------------------------------------------------
+
+def _write_output(rows: list[RowDict], headers: list[str], filepath: str) -> int:
+    """Write query results to file. Format determined by extension."""
+    ext = filepath.rsplit('.', 1)[-1].lower() if '.' in filepath else ''
+
+    if ext == 'xlsx':
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(headers)
+        for row in rows:
+            ws.append([_cell_value(row.get(h)) for h in headers])
+        wb.save(filepath)
+    else:
+        delim = '\t' if ext == 'tsv' else ','
+        with open(filepath, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f, delimiter=delim, quoting=csv.QUOTE_NONNUMERIC)
+            writer.writerow(headers)
+            for row in rows:
+                writer.writerow([_cell_value(row.get(h)) for h in headers])
+
+    return len(rows)
+
+
+def _cell_value(value: object) -> object:
+    """Convert data value to a format suitable for export."""
+    if value is None:
+        return ''
+    return value
 
 
 # ---------------------------------------------------------------------------

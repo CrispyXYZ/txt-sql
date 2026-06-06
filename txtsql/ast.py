@@ -143,6 +143,7 @@ class SelectStatement:
     order_by: list[tuple[str, bool]] | None  # (column, desc)
     limit: int | None
     offset: int
+    output_file: str | None  # INTO OUTFILE path; None for normal SELECT
 
 
 @dataclass(slots=True, frozen=True)

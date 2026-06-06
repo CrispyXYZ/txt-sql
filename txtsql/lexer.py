@@ -38,6 +38,7 @@ class TokenType(StrEnum):
     DELETE = 'DELETE'
     FROM = 'FROM'
     IMPORT = 'IMPORT'
+    OUTFILE = 'OUTFILE'
     WHERE = 'WHERE'
     AND = 'AND'
     OR = 'OR'
@@ -193,6 +194,8 @@ class Lexer:
                 token_type = TokenType.DELETE
             case 'IMPORT':
                 token_type = TokenType.IMPORT
+            case 'OUTFILE':
+                token_type = TokenType.OUTFILE
             case 'FROM':
                 token_type = TokenType.FROM
             case 'WHERE':

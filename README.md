@@ -109,6 +109,16 @@ IMPORT table_name (col1 STRING, col2 NUMBER) FROM 'path/to/file.xlsx';
 - Types are auto-inferred (NUMBER if all values are numeric, otherwise STRING)
 - Optional column definitions override auto-inference
 
+### EXPORT (query results to file)
+
+```sql
+SELECT * FROM table_name INTO OUTFILE 'path/to/data.xlsx';
+SELECT dept, AVG(salary) AS avg FROM emp GROUP BY dept INTO OUTFILE 'report.csv';
+```
+- Format determined by file extension: `.xlsx`, `.csv`, `.tsv`
+- Headers are automatically included in the output
+- Returns number of rows exported
+
 ### WHERE / HAVING expressions
 
 ```sql

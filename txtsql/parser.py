@@ -375,8 +375,15 @@ class Parser:
                         f'when used with aggregate functions'
                     )
 
+        # Optional INTO OUTFILE
+        output_file: str | None = None
+        if self.current_token().type == TokenType.INTO:
+            self.eat(TokenType.INTO)
+            self.eat(TokenType.OUTFILE)
+            output_file = self.eat(TokenType.STRING).value
+
         return SelectStatement(table_name, columns, aggregates, distinct,
-                               where_clause, group_by, having, order_by, limit, offset)
+                               where_clause, group_by, having, order_by, limit, offset, output_file)
 
     _AGG_FUNC_TOKEN_MAP = {
         TokenType.COUNT: AggFunc.COUNT,
