@@ -7,10 +7,11 @@ import openpyxl
 from . import storage
 from .ast import (
     DropTable, CreateTable, InsertValues, DeleteStatement, SelectStatement, UpdateStatement, ImportStatement,
+    ShowTables, DescribeTable,
     AggFunc, AggregateColumn,
 )
 from .evaluator import evaluate_where
-from .exceptions import ColumnNotFoundError, TableNotFoundError, EngineError
+from .exceptions import ColumnNotFoundError, TableNotFoundError, EngineError, TxtSqlError
 from .types import Types, RowDict, DataValue
 
 # ---------------------------------------------------------------------------
@@ -249,6 +250,33 @@ def execute_update(statement: UpdateStatement) -> int:
     table.update(values, where=where_func)
 
     return affected
+
+
+# ---------------------------------------------------------------------------
+# System commands
+# ---------------------------------------------------------------------------
+
+def execute_show_tables(statement: ShowTables) -> list[RowDict]:
+    """Return a list of all tables with their row counts."""
+    rows: list[RowDict] = []
+    for name, col_count, defs in storage.list_tables():
+        table = storage.get_table(name)
+        row_count = table.count_rows() if table else 0
+        col_names = ', '.join(defs.keys())
+        rows.append({'Table': name, 'Columns': col_names, 'Rows': row_count})
+    return rows
+
+
+def execute_describe(statement: DescribeTable) -> list[RowDict]:
+    """Return column definitions for a specific table."""
+    table = storage.get_table(statement.table_name)
+    if table is None:
+        raise TableNotFoundError(f'Table does not exist: {statement.table_name}')
+    rows: list[RowDict] = []
+    for col_name, col_type in table.defs.items():
+        rows.append({'Column': col_name, 'Type': col_type.value})
+    rows.append({'Column': '__rows__', 'Type': str(table.count_rows())})
+    return rows
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ from .ast import (
     WhereClause, AggregateColumn,
     CreateTable, DropTable, InsertValues,
     DeleteStatement, SelectStatement, UpdateStatement, ImportStatement,
+    ShowTables, DescribeTable,
 )
 from .exceptions import SqlSyntaxError
 from .lexer import Token, TokenType
@@ -33,7 +34,7 @@ class Parser:
             return self.tokens[self.pos + 1].type
         return TokenType.EOF
 
-    def parse(self) -> CreateTable | DropTable | InsertValues | DeleteStatement | SelectStatement | UpdateStatement | ImportStatement:
+    def parse(self) -> CreateTable | DropTable | InsertValues | DeleteStatement | SelectStatement | UpdateStatement | ImportStatement | ShowTables | DescribeTable:
         token = self.current_token()
         match token.type:
             case TokenType.CREATE:
@@ -50,6 +51,10 @@ class Parser:
                 return self.update_statement()
             case TokenType.IMPORT:
                 return self.import_statement()
+            case TokenType.SHOW:
+                return self.show_tables()
+            case TokenType.DESCRIBE:
+                return self.describe()
             case _:
                 raise SqlSyntaxError(f'Unexpected statement: {token.type}')
 
@@ -484,3 +489,19 @@ class Parser:
             self.eat(TokenType.SEMICOLON)
 
         return ImportStatement(table_name, file_path, columns)
+
+    def show_tables(self) -> ShowTables:
+        """Parse SHOW TABLES;"""
+        self.eat(TokenType.SHOW)
+        self.eat(TokenType.TABLES)
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+        return ShowTables()
+
+    def describe(self) -> DescribeTable:
+        """Parse DESCRIBE table_name;"""
+        self.eat(TokenType.DESCRIBE)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.eat(TokenType.SEMICOLON)
+        return DescribeTable(table_name)

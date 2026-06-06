@@ -65,6 +65,26 @@ def get_table(name: str) -> Table | None:
         return None
 
 
+def list_tables() -> list[tuple[str, int, dict[str, str]]]:
+    """Return all tables with their row counts and column definitions.
+    Returns: list of (table_name, row_count, {col_name: col_type_str})
+    """
+    result: list[tuple[str, int, dict[str, str]]] = []
+    try:
+        with open(METADATA_FILENAME, 'r', encoding='utf-8') as metadata:
+            reader = csv.reader(metadata, delimiter='\t')
+            for row in reader:
+                if not row:
+                    continue
+                name = row[0]
+                count = int(row[1])
+                defs = {row[i]: row[i + 1] for i in range(2, len(row), 2)}
+                result.append((name, count, defs))
+    except FileNotFoundError:
+        pass
+    return result
+
+
 def drop_table(name: str) -> None:
     """Drop table and erase metadata."""
     _log.debug(f'Dropping table: {name}')

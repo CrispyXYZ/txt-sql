@@ -99,6 +99,15 @@ DELETE FROM table_name [WHERE condition];
 DROP TABLE table_name;
 ```
 
+### SHOW TABLES / DESCRIBE (system commands)
+
+```sql
+SHOW TABLES;
+DESCRIBE table_name;
+```
+- `SHOW TABLES` lists all tables with column names and row counts
+- `DESCRIBE` shows column definitions and row count for a specific table
+
 ### IMPORT (Excel)
 
 ```sql

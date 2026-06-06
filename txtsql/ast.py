@@ -159,3 +159,15 @@ class ImportStatement:
     table_name: str
     file_path: str
     columns: list[tuple[str, str]] | None  # None = auto-infer types from data
+
+
+@dataclass(slots=True, frozen=True)
+class ShowTables:
+    """SHOW TABLES;"""
+    pass
+
+
+@dataclass(slots=True, frozen=True)
+class DescribeTable:
+    """DESCRIBE table_name;"""
+    table_name: str

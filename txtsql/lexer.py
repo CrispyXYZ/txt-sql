@@ -39,6 +39,9 @@ class TokenType(StrEnum):
     FROM = 'FROM'
     IMPORT = 'IMPORT'
     OUTFILE = 'OUTFILE'
+    SHOW = 'SHOW'
+    TABLES = 'TABLES'
+    DESCRIBE = 'DESCRIBE'
     WHERE = 'WHERE'
     AND = 'AND'
     OR = 'OR'
@@ -196,6 +199,12 @@ class Lexer:
                 token_type = TokenType.IMPORT
             case 'OUTFILE':
                 token_type = TokenType.OUTFILE
+            case 'SHOW':
+                token_type = TokenType.SHOW
+            case 'TABLES':
+                token_type = TokenType.TABLES
+            case 'DESCRIBE':
+                token_type = TokenType.DESCRIBE
             case 'FROM':
                 token_type = TokenType.FROM
             case 'WHERE':
