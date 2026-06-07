@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "txtsql"
+version = "0.2.0"
+description = "A lightweight DBMS that stores data in TSV files with a simple SQL interface"
+readme = "README.md"
+license = "MIT"
+authors = [{name = "CrispyXYZ"}]
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/CrispyXYZ/txt-sql"
+Repository = "https://github.com/CrispyXYZ/txt-sql"
+
+[project.scripts]
+txtsql = "txtsql.cli:run_cli"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["txtsql"]

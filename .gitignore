@@ -1,7 +1,25 @@
+# IDE
 .idea/
-temp/
-tmp/
+
+# Python build artifacts
+dist/
+build/
+*.egg-info/
+*.whl
+
+# Virtual environment
+.venv/
+venv/
+
+# Cache
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Temp
+temp/
+tmp/
+
+# Data files (TSV storage)
 *.txt
 !README.md
