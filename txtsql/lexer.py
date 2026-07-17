@@ -226,7 +226,7 @@ class Lexer:
             case 'STRING' | 'VARCHAR':
                 token_type = TokenType.STRING
                 identifier = 'STRING'
-            case 'NUMBER' | 'DECIMAL':
+            case 'NUMBER' | 'DECIMAL' | 'INT':
                 token_type = TokenType.NUMBER
                 identifier = 'NUMBER'
             case _:

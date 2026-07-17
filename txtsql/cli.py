@@ -48,34 +48,53 @@ def run_cli() -> None:
     print("Welcome to TxtSql CLI. Type your SQL statement and press Enter.")
     print("Type 'exit' or 'quit' to exit.")
 
+    buffer = []          # accumulate lines of the current statement
+    prompt = "txtsql> "
+
     while True:
         try:
-            line = input("txtsql> ")
-            if line.strip().lower() in ('exit', 'quit'):
-                break
-            if not line.strip():
-                continue
-
-            result = execute_sql(line.strip())
-
-            if isinstance(result, list):
-                print_table(result)
-            elif isinstance(result, int):
-                print(f"{result} rows affected.")
-            elif result is not None:
-                print(result)
-            else:
-                print("Query OK.")
-
+            line = input(prompt)
         except (EOFError, KeyboardInterrupt):
             print()
+            if buffer:   # discard incomplete statement and restart
+                buffer.clear()
+                prompt = "txtsql> "
+                continue
+            break        # exit if no pending input
+
+        stripped = line.strip()
+
+        # Exit command only when buffer is empty
+        if not buffer and stripped.lower() in ('exit', 'quit'):
             break
-        except TxtSqlError as e:
-            print(f"Error: {e}")
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            traceback.print_exc()
 
+        # Add the line to buffer (preserve original formatting)
+        buffer.append(line)
 
-if __name__ == "__main__":
-    run_cli()
+        # Reconstruct current statement
+        statement = "\n".join(buffer).rstrip()
+
+        # Check if the statement ends with a semicolon -> complete
+        if statement.endswith(";"):
+            try:
+                result = execute_sql(statement.rstrip(";").strip())
+            except TxtSqlError as e:
+                print(f"Error: {e}")
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                traceback.print_exc()
+            else:
+                if isinstance(result, list):
+                    print_table(result)
+                elif isinstance(result, int):
+                    print(f"{result} rows affected.")
+                elif result is not None:
+                    print(result)
+                else:
+                    print("Query OK.")
+            finally:
+                buffer.clear()
+                prompt = "txtsql> "
+        else:
+            # Statement not complete – change prompt for continuation
+            prompt = "... "
