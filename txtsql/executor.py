@@ -1,5 +1,6 @@
 """Statement executors: interpret AST and drive a StorageEngine instance."""
 
+from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -7,17 +8,24 @@ from .ast import (
     DropTable, CreateTable, CreateIndex, DropIndex, InsertValues, InsertSelect,
     DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
     ShowTables, ShowIndexes, DescribeTable,
-    AggFunc, AggregateExpression, ColumnExpression, LiteralExpression, StarExpression,
+    AggFunc, AggregateExpression, ColumnExpression, Expression, LiteralExpression, StarExpression,
     JoinClause, JoinType, SelectExpression,
     contains_aggregate,
 )
 from .evaluator import (
     EvalContext, evaluate_where, evaluate_expression, resolve_column_name,
-    resolve_column, to_bool, to_decimal,
+    resolve_column, is_number, to_bool, to_decimal,
 )
 from .exceptions import ColumnNotFoundError, TableAlreadyExistsError, TableNotFoundError, EngineError, TypeMismatchError
 from .index import match_single_table_index
 from .io_handlers import export_rows, read_excel_table
+from .optimizer import (
+    EquiKeySpec,
+    VisibleColumn,
+    analyze_predicate_pushdown,
+    extract_equi_join_keys,
+    read_equi_key,
+)
 from .result import QueryResult, StatementKind
 from .storage import StorageEngine, Table
 from .types import Types, RowDict, DataValue
@@ -33,13 +41,7 @@ Statement = (
 )
 
 
-@dataclass(frozen=True)
-class _VisibleColumn:
-    """A column visible in the current joined relation."""
-    qualifier: str
-    name: str
-    key: str
-    coalesce_keys: tuple[str, ...] = ()
+_VisibleColumn = VisibleColumn
 
 
 class QueryExecutor:
@@ -390,6 +392,43 @@ class QueryExecutor:
             return self.execute_union_result(sub, outer_row=outer_row).rows
         return []
 
+    def _scan_table_rows(
+        self,
+        table: Table,
+        alias: str,
+        predicate: Expression | None,
+        outer_row: RowDict | None,
+        copy_rows: bool = True,
+    ) -> tuple[list[RowDict], Expression | None]:
+        """Scan a single table, leveraging secondary index access if enabled and matched."""
+        all_rows = self.storage.get_table_rows(table)
+        residual = predicate
+        selected: list[RowDict]
+
+        if self.enable_optimizations and predicate is not None:
+            table_indexes = self.storage.get_table_indexes(table)
+            idx_match = match_single_table_index(predicate, table_indexes, single_qualifier=alias)
+            if idx_match is not None:
+                selected = [dict(all_rows[rid]) if copy_rows else all_rows[rid] for rid in idx_match.row_ids]
+                residual = idx_match.residual_expr
+            else:
+                selected = [dict(r) for r in all_rows] if copy_rows else all_rows
+        else:
+            selected = [dict(r) for r in all_rows] if copy_rows else all_rows
+
+        if residual is not None:
+            ctx = EvalContext(
+                table_defs=table.column_types(),
+                subquery_exec=self._exec_subquery,
+                outer_row=outer_row,
+                valid_single_qualifier=alias,
+            )
+            where_func = evaluate_where(residual, ctx)
+            selected = [r for r in selected if where_func(r)]
+            residual = None
+
+        return selected, residual
+
     def _build_select_rows(
         self,
         statement: SelectStatement,
@@ -397,7 +436,7 @@ class QueryExecutor:
     ) -> tuple[list[RowDict], list[str]]:
         """Execute the core SELECT pipeline up through ORDER BY (before LIMIT/OFFSET)."""
         sources = statement.sources
-        tables = [self._get_table(src.name) for src in sources]
+        src_tables = [self._get_table(src.name) for src in sources]
 
         seen_aliases: set[str] = set()
         for src in sources:
@@ -411,6 +450,23 @@ class QueryExecutor:
                 raise EngineError(f'Not unique table/alias: {alias}')
             seen_aliases.add(alias)
 
+        join_tables = [self._get_table(jc.source.name) for jc in statement.joins]
+        tables = src_tables + join_tables
+        alias_table_map: dict[str, Table] = {}
+        table_columns_map: dict[str, list[str]] = {}
+        for src, t in zip(sources, src_tables):
+            alias = src.alias or src.name
+            alias_table_map[alias] = t
+            table_columns_map[alias] = t.column_names()
+        for jc, t in zip(statement.joins, join_tables):
+            alias = jc.source.alias or jc.source.name
+            alias_table_map[alias] = t
+            table_columns_map[alias] = t.column_names()
+
+        all_defs: dict[str, Types] = {}
+        for t in tables:
+            all_defs.update(t.column_types())
+
         use_prefixes = len(sources) > 1 or bool(statement.joins)
         single_qualifier = (sources[0].alias or sources[0].name) if not use_prefixes else None
 
@@ -419,49 +475,77 @@ class QueryExecutor:
         residual_where = statement.where_clause.expression if statement.where_clause is not None else None
 
         if use_prefixes:
-            rows_per_table = [self.storage.get_table_rows(table) for table in tables]
-            for combo in _cartesian_product(rows_per_table):
-                row: RowDict = {}
-                for src, r in zip(sources, combo):
+            source_preds: dict[str, Expression] = {}
+            if self.enable_optimizations:
+                merged_cols: set[str] = set()
+                seen_col_names = set(src_tables[0].column_names())
+                for s_t in src_tables[1:]:
+                    seen_col_names.update(s_t.column_names())
+                for jc, jt in zip(statement.joins, join_tables):
+                    if jc.using_columns:
+                        merged_cols.update(jc.using_columns)
+                    elif jc.natural:
+                        jcols = set(jt.column_names())
+                        merged_cols.update(seen_col_names & jcols)
+                    seen_col_names.update(jt.column_names())
+
+                pushdown = analyze_predicate_pushdown(
+                    residual_where,
+                    sources,
+                    statement.joins,
+                    table_columns_map,
+                    using_or_natural_cols=merged_cols,
+                )
+                source_preds = pushdown.source_predicates
+                active_joins = pushdown.rewritten_joins
+                residual_where = pushdown.residual_where
+
+                first_src = sources[0]
+                first_alias = first_src.alias or first_src.name
+                first_rows, _ = self._scan_table_rows(
+                    src_tables[0], first_alias, source_preds.get(first_alias), outer_row, copy_rows=False,
+                )
+                combined = [_prefix_row(r, first_alias) for r in first_rows]
+                visible_columns = [
+                    _VisibleColumn(first_alias, col, f"{first_alias}.{col}")
+                    for col in src_tables[0].column_names()
+                ]
+            else:
+                active_joins = statement.joins
+                rows_per_table = [self.storage.get_table_rows(table) for table in src_tables]
+                for combo in _cartesian_product(rows_per_table):
+                    row: RowDict = {}
+                    for src, r in zip(sources, combo):
+                        alias = src.alias or src.name
+                        row.update(_prefix_row(r, alias))
+                    combined.append(row)
+                visible_columns = []
+                for src, table in zip(sources, src_tables):
                     alias = src.alias or src.name
-                    row.update(_prefix_row(r, alias))
-                combined.append(row)
-            visible_columns = []
-            for src, table in zip(sources, tables):
-                alias = src.alias or src.name
-                visible_columns.extend(
-                    _VisibleColumn(alias, col, f"{alias}.{col}") for col in table.column_names()
+                    visible_columns.extend(
+                        _VisibleColumn(alias, col, f"{alias}.{col}") for col in table.column_names()
+                    )
+
+            for jc in active_joins:
+                join_alias = jc.source.alias or jc.source.name
+                join_table = alias_table_map[join_alias]
+                right_columns = [
+                    _VisibleColumn(join_alias, col, f"{join_alias}.{col}")
+                    for col in join_table.column_names()
+                ]
+                scanned_right, _ = self._scan_table_rows(
+                    join_table, join_alias, source_preds.get(join_alias), outer_row, copy_rows=False,
+                )
+                right_rows = [_prefix_row(r, join_alias) for r in scanned_right]
+                combined, visible_columns = self._apply_join(
+                    combined, visible_columns, right_rows, right_columns, jc,
+                    outer_row=outer_row,
                 )
         else:
-            all_rows = self.storage.get_table_rows(tables[0])
-            idx_match = None
-            if self.enable_optimizations and residual_where is not None:
-                table_indexes = self.storage.get_table_indexes(tables[0])
-                idx_match = match_single_table_index(residual_where, table_indexes, single_qualifier)
-            if idx_match is not None:
-                combined = [dict(all_rows[rid]) for rid in idx_match.row_ids]
-                residual_where = idx_match.residual_expr
-            else:
-                combined = [dict(r) for r in all_rows]
-
-        # Apply explicit JOIN clauses left-to-right.
-        for jc in statement.joins:
-            join_table = self._get_table(jc.source.name)
-            join_alias = jc.source.alias or jc.source.name
-            right_columns = [
-                _VisibleColumn(join_alias, col, f"{join_alias}.{col}")
-                for col in join_table.column_names()
-            ]
-            right_rows = [_prefix_row(r, join_alias) for r in self.storage.get_table_rows(join_table)]
-            combined, visible_columns = self._apply_join(
-                combined, visible_columns or [], right_rows, right_columns, jc,
-                outer_row=outer_row,
+            combined, _ = self._scan_table_rows(
+                src_tables[0], single_qualifier or src_tables[0].name, residual_where, outer_row, copy_rows=True,
             )
-            tables.append(join_table)
-
-        all_defs: dict[str, Types] = {}
-        for t in tables:
-            all_defs.update(t.column_types())
+            residual_where = None
 
         base_ctx = EvalContext(
             table_defs=all_defs,
@@ -470,16 +554,10 @@ class QueryExecutor:
             valid_single_qualifier=single_qualifier,
         )
 
-        # WHERE applies after the full FROM/JOIN has been built.
+        # Remaining WHERE applies after FROM/JOIN construction.
         if residual_where is not None:
             where_func = evaluate_where(residual_where, base_ctx)
             combined = [r for r in combined if where_func(r)]
-
-        table_columns_map: dict[str, list[str]] = {}
-        for src, t in zip(sources, tables[:len(sources)]):
-            table_columns_map[src.alias or src.name] = t.column_names()
-        for jc, t in zip(statement.joins, tables[len(sources):]):
-            table_columns_map[jc.source.alias or jc.source.name] = t.column_names()
 
         expanded_columns = (
             _expand_select_expressions(
@@ -568,7 +646,7 @@ class QueryExecutor:
         jc: JoinClause,
         outer_row: RowDict | None = None,
     ) -> tuple[list[RowDict], list[_VisibleColumn]]:
-        """Apply one JOIN clause to the current left relation."""
+        """Apply one JOIN clause using Hash Join for equi-joins (when enabled) or Nested Loop."""
         common = _common_join_columns(left_columns, right_columns, jc)
         null_right = {col.key: None for col in right_columns}
         null_left = {col.key: None for col in left_columns}
@@ -580,22 +658,33 @@ class QueryExecutor:
                 for right_row in right_rows:
                     new_rows.append({**left_row, **right_row})
         else:
-            for left_row in left_rows:
-                matches: list[tuple[int, RowDict]] = []
-                for right_index, right_row in enumerate(right_rows):
-                    if self._join_match(left_row, right_row, left_columns, right_columns, jc, common, outer_row):
-                        matches.append((right_index, {**left_row, **right_row}))
-                        if jc.join_type in (JoinType.RIGHT, JoinType.FULL):
-                            matched_right.add(right_index)
-                if matches:
-                    new_rows.extend(row for _, row in matches)
-                elif jc.join_type in (JoinType.LEFT, JoinType.FULL):
-                    new_rows.append({**left_row, **null_right})
+            equi_pairs: list[tuple[EquiKeySpec, EquiKeySpec]] = []
+            residual_cond: Expression | None = None
+            if self.enable_optimizations:
+                equi_pairs, residual_cond = extract_equi_join_keys(left_columns, right_columns, jc, common)
 
-            if jc.join_type in (JoinType.RIGHT, JoinType.FULL):
-                for right_index, right_row in enumerate(right_rows):
-                    if right_index not in matched_right:
-                        new_rows.append({**null_left, **right_row})
+            if equi_pairs:
+                new_rows = self._hash_join(
+                    left_rows, right_rows, equi_pairs, residual_cond,
+                    jc.join_type, null_left, null_right, outer_row,
+                )
+            else:
+                for left_row in left_rows:
+                    matches: list[tuple[int, RowDict]] = []
+                    for right_index, right_row in enumerate(right_rows):
+                        if self._join_match(left_row, right_row, left_columns, right_columns, jc, common, outer_row):
+                            matches.append((right_index, {**left_row, **right_row}))
+                            if jc.join_type in (JoinType.RIGHT, JoinType.FULL):
+                                matched_right.add(right_index)
+                    if matches:
+                        new_rows.extend(row for _, row in matches)
+                    elif jc.join_type in (JoinType.LEFT, JoinType.FULL):
+                        new_rows.append({**left_row, **null_right})
+
+                if jc.join_type in (JoinType.RIGHT, JoinType.FULL):
+                    for right_index, right_row in enumerate(right_rows):
+                        if right_index not in matched_right:
+                            new_rows.append({**null_left, **right_row})
 
         visible = _visible_after_join(left_columns, right_columns, jc, common)
 
@@ -606,6 +695,84 @@ class QueryExecutor:
                     row[col.name] = _coalesced_value(row, col)
 
         return new_rows, visible
+
+    def _hash_join(
+        self,
+        left_rows: list[RowDict],
+        right_rows: list[RowDict],
+        equi_pairs: list[tuple[EquiKeySpec, EquiKeySpec]],
+        residual_cond: Expression | None,
+        join_type: JoinType,
+        null_left: RowDict,
+        null_right: RowDict,
+        outer_row: RowDict | None,
+    ) -> list[RowDict]:
+        """O(M + N) in-memory Hash Join preserving NULL and outer-join semantics."""
+        def _norm(val: DataValue) -> tuple[int, Decimal | str] | None:
+            if val is None:
+                return None
+            if is_number(val):
+                return (1, to_decimal(val))
+            if isinstance(val, str):
+                return (2, val)
+            raise TypeMismatchError(f'Unsupported join key type: {type(val).__name__}')
+
+        buckets: dict[tuple, list[tuple[int, RowDict]]] = defaultdict(list)
+        right_groups: list[set[int]] = [set() for _ in equi_pairs]
+
+        for right_index, right_row in enumerate(right_rows):
+            parts: list[tuple[int, Decimal | str]] = []
+            has_null = False
+            for k_idx, (_, rspec) in enumerate(equi_pairs):
+                comp = _norm(read_equi_key(right_row, rspec))
+                if comp is None:
+                    has_null = True
+                else:
+                    right_groups[k_idx].add(comp[0])
+                    parts.append(comp)
+            if not has_null:
+                buckets[tuple(parts)].append((right_index, right_row))
+
+        new_rows: list[RowDict] = []
+        matched_right: set[int] = set()
+        res_ctx = (
+            EvalContext(subquery_exec=self._exec_subquery, outer_row=outer_row)
+            if residual_cond is not None
+            else None
+        )
+
+        for left_row in left_rows:
+            lparts: list[tuple[int, Decimal | str]] = []
+            has_null = False
+            for k_idx, (lspec, _) in enumerate(equi_pairs):
+                comp = _norm(read_equi_key(left_row, lspec))
+                if comp is None:
+                    has_null = True
+                else:
+                    if right_groups[k_idx] and comp[0] not in right_groups[k_idx]:
+                        raise TypeMismatchError('Cannot compare NUMBER and STRING in JOIN key')
+                    lparts.append(comp)
+
+            matches: list[RowDict] = []
+            if not has_null:
+                for right_index, right_row in buckets.get(tuple(lparts), ()):
+                    merged = {**left_row, **right_row}
+                    if residual_cond is None or to_bool(evaluate_expression(residual_cond, merged, res_ctx)):
+                        matches.append(merged)
+                        if join_type in (JoinType.RIGHT, JoinType.FULL):
+                            matched_right.add(right_index)
+
+            if matches:
+                new_rows.extend(matches)
+            elif join_type in (JoinType.LEFT, JoinType.FULL):
+                new_rows.append({**left_row, **null_right})
+
+        if join_type in (JoinType.RIGHT, JoinType.FULL):
+            for right_index, right_row in enumerate(right_rows):
+                if right_index not in matched_right:
+                    new_rows.append({**null_left, **right_row})
+
+        return new_rows
 
     def _join_match(
         self,

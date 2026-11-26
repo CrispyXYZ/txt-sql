@@ -5,7 +5,11 @@ from decimal import Decimal
 import pytest
 
 from txtsql import Database
+from txtsql.ast import SelectStatement
 from txtsql.exceptions import ColumnNotFoundError, EngineError, TableNotFoundError, TypeMismatchError
+from txtsql.lexer import Lexer
+from txtsql.optimizer import analyze_predicate_pushdown
+from txtsql.parser import Parser
 from txtsql.result import StatementKind
 
 
@@ -117,3 +121,82 @@ class TestSingleTableIndexScanParity:
             db.execute("SELECT * FROM scores WHERE grade = 'not_a_number';")
         with pytest.raises(TypeMismatchError):
             db.execute("SELECT * FROM scores WHERE grade BETWEEN 'a' AND 'z';")
+
+
+class TestHashJoinAndPredicatePushdown:
+    def _seed_join_tables(self, db: Database) -> None:
+        db.execute("CREATE TABLE dept (id NUMBER, dname STRING, budget NUMBER);")
+        db.execute(
+            "INSERT INTO dept VALUES "
+            "(10, 'Eng', 500), (20, 'Sales', 300), (30, 'HR', 100), (NULL, 'Phantom', 0);"
+        )
+        db.execute("CREATE TABLE emp (eid NUMBER, ename STRING, id NUMBER, salary NUMBER);")
+        db.execute(
+            "INSERT INTO emp VALUES "
+            "(1, 'Alice', 10, 120), (2, 'Bob', 10, 140), "
+            "(3, 'Cara', 20, 90), (4, 'Dan', 99, 80), (5, 'Eve', NULL, 110);"
+        )
+        db.execute("CREATE TABLE bonus (eid NUMBER, year NUMBER, amount NUMBER);")
+        db.execute(
+            "INSERT INTO bonus VALUES "
+            "(1, 2025, 30), (1, 2026, 40), (3, 2026, 20);"
+        )
+        db.execute("CREATE INDEX idx_emp_id ON emp (id);")
+        db.execute("CREATE INDEX idx_dept_id ON dept (id);")
+
+    @pytest.mark.parametrize(
+        'sql',
+        [
+            "SELECT e.eid, e.ename, d.dname FROM emp e INNER JOIN dept d ON e.id = d.id ORDER BY e.eid;",
+            "SELECT e.eid, d.dname FROM emp e LEFT JOIN dept d ON e.id = d.id ORDER BY e.eid;",
+            "SELECT e.eid, d.dname FROM emp e RIGHT JOIN dept d ON e.id = d.id ORDER BY e.eid, d.dname;",
+            "SELECT e.eid, d.dname FROM emp e FULL JOIN dept d ON e.id = d.id ORDER BY e.eid, d.dname;",
+            "SELECT e.eid, d.dname FROM emp e NATURAL JOIN dept d ORDER BY e.eid;",
+            "SELECT e.eid, d.dname FROM emp e FULL JOIN dept d USING (id) ORDER BY e.eid, d.dname;",
+            "SELECT e.eid, d.dname FROM emp e LEFT JOIN dept d ON e.id = d.id AND d.budget >= 400 ORDER BY e.eid;",
+            "SELECT e.eid, d.dname FROM emp e LEFT JOIN dept d ON e.id = d.id WHERE d.dname IS NULL ORDER BY e.eid;",
+            "SELECT e.eid, d.dname FROM emp e RIGHT JOIN dept d ON e.id = d.id WHERE e.eid IS NULL ORDER BY d.dname;",
+            "SELECT e.eid, d.dname FROM emp e, dept d WHERE e.id = d.id AND e.salary > 100 AND d.budget > 200 ORDER BY e.eid;",
+            "SELECT e.eid, d.dname, b.amount FROM emp e, dept d, bonus b WHERE e.id = d.id AND e.eid = b.eid AND b.year = 2026 ORDER BY e.eid;",
+            "SELECT e.eid, d.dname, b.amount FROM emp e JOIN dept d ON e.id = d.id LEFT JOIN bonus b ON e.eid = b.eid AND b.amount >= 30 WHERE d.id = 10 ORDER BY e.eid, b.amount;",
+        ],
+    )
+    def test_optimized_joins_and_pushdown_match_unoptimized(self, tmp_path, sql):
+        db_opt = Database(tmp_path, enable_optimizations=True)
+        self._seed_join_tables(db_opt)
+        db_noopt = Database(tmp_path, enable_optimizations=False)
+
+        assert db_opt.execute(sql).rows == db_noopt.execute(sql).rows
+
+    def test_analyze_predicate_pushdown_and_outer_join_safety(self, tmp_path):
+        db = Database(tmp_path)
+        self._seed_join_tables(db)
+        tmap = {'e': ['eid', 'ename', 'id', 'salary'], 'd': ['id', 'dname', 'budget']}
+
+        sql1 = "SELECT e.eid, d.dname FROM emp e, dept d WHERE e.id = d.id AND e.salary > 100 AND d.budget > 200;"
+        stmt1 = Parser(Lexer(sql1).tokenize()).parse()
+        assert isinstance(stmt1, SelectStatement)
+        plan1 = analyze_predicate_pushdown(stmt1.where_clause.expression, stmt1.sources, stmt1.joins, tmap)
+        assert plan1.pushed_count == 2
+        assert plan1.rewritten_implicit_joins == 1
+        assert plan1.residual_where is None
+        assert len(plan1.rewritten_joins) == 1
+
+        # LEFT JOIN null-producing side 'd' must NOT receive pushed predicates
+        sql2 = "SELECT e.eid, d.dname FROM emp e LEFT JOIN dept d ON e.id = d.id WHERE e.salary > 100 AND d.dname IS NULL;"
+        stmt2 = Parser(Lexer(sql2).tokenize()).parse()
+        assert isinstance(stmt2, SelectStatement)
+        plan2 = analyze_predicate_pushdown(stmt2.where_clause.expression, stmt2.sources, stmt2.joins, tmap)
+        assert 'e' in plan2.source_predicates
+        assert 'd' not in plan2.source_predicates
+        assert plan2.residual_where is not None
+
+    def test_hash_join_type_mismatch_raises(self, tmp_path):
+        db = Database(tmp_path, enable_optimizations=True)
+        db.execute("CREATE TABLE a (k NUMBER);")
+        db.execute("CREATE TABLE b (k STRING);")
+        db.execute("INSERT INTO a VALUES (1);")
+        db.execute("INSERT INTO b VALUES ('1');")
+        with pytest.raises(TypeMismatchError):
+            db.execute("SELECT * FROM a JOIN b ON a.k = b.k;")
+
