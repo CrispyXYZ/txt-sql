@@ -339,6 +339,13 @@ class ShowIndexes:
     table_name: str | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class ExplainStatement:
+    """EXPLAIN [ANALYZE] <SELECT | UNION>;"""
+    query: 'SelectStatement | UnionStatement'
+    analyze: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Shared AST traversal helpers
 # ---------------------------------------------------------------------------

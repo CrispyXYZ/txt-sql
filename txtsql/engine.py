@@ -30,7 +30,7 @@ class Database:
         """Lex, parse, and execute a SQL statement, returning a structured QueryResult."""
         tokens = Lexer(sql).tokenize()
         statement = Parser(tokens).parse()
-        return self.executor.execute(statement)
+        return self.executor.execute(statement, tokens=tokens)
 
     def list_tables(self) -> list[tuple[str, int, dict[str, str]]]:
         """Return metadata for all tables in this database directory."""

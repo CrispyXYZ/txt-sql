@@ -22,12 +22,14 @@ _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 _LINE_COMMENT_RE = re.compile(r'--[^\n]*')
 
 SQL_KEYWORDS: tuple[str, ...] = (
-    'CREATE', 'DROP', 'TABLE', 'IF', 'NOT', 'EXISTS', 'INSERT', 'INTO', 'VALUES',
+    'CREATE', 'DROP', 'TABLE', 'INDEX', 'INDEXES', 'IF', 'NOT', 'EXISTS', 'INSERT', 'INTO', 'VALUES',
     'SELECT', 'DISTINCT', 'FROM', 'WHERE', 'AND', 'OR', 'IS', 'NULL', 'TRUE', 'FALSE',
     'IN', 'BETWEEN', 'LIKE', 'ANY', 'ALL', 'UNION', 'JOIN', 'INNER', 'LEFT', 'RIGHT',
     'FULL', 'OUTER', 'CROSS', 'NATURAL', 'ON', 'USING', 'AS', 'GROUP', 'BY', 'HAVING',
     'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'UPDATE', 'SET', 'DELETE', 'IMPORT',
-    'OUTFILE', 'SHOW', 'TABLES', 'DESCRIBE', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
+    'OUTFILE', 'SHOW', 'TABLES', 'DESCRIBE', 'EXPLAIN', 'ANALYZE', 'CHECK',
+    'BEGIN', 'COMMIT', 'ROLLBACK', 'TRANSACTION',
+    'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
     'STRING', 'NUMBER', 'VARCHAR', 'DECIMAL', 'INT',
 )
 AGG_FUNCTIONS: tuple[str, ...] = ('COUNT', 'SUM', 'AVG', 'MIN', 'MAX')
@@ -42,6 +44,7 @@ class TableMeta:
     name: str
     row_count: int
     columns: tuple[tuple[str, str], ...]
+    indexes: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +136,23 @@ DEMO_TEMPLATES: dict[str, str] = {
         "SELECT id, name FROM demo_b\n"
         "WHERE name LIKE 'B%'\n"
         "ORDER BY id ASC;"
+    ),
+    '5. 索引、优化与执行计划剖析 (EXPLAIN ANALYZE)': (
+        "-- 白盒执行剖析演示：二级索引 + 谓词下推 + Hash Join\n"
+        "DROP TABLE IF EXISTS demo_orders;\n"
+        "DROP TABLE IF EXISTS demo_users;\n"
+        "CREATE TABLE demo_users (id NUMBER, name STRING, city STRING);\n"
+        "INSERT INTO demo_users VALUES\n"
+        "    (1, '张三', 'Harbin'), (2, '李四', 'Beijing'), (3, '王五', 'Harbin');\n"
+        "CREATE TABLE demo_orders (oid NUMBER, uid NUMBER, amount NUMBER);\n"
+        "INSERT INTO demo_orders VALUES\n"
+        "    (101, 1, 299), (102, 1, 520), (103, 2, 180), (104, 3, 660);\n"
+        "CREATE INDEX idx_users_city ON demo_users (city);\n"
+        "CREATE INDEX idx_orders_uid ON demo_orders (uid);\n"
+        "EXPLAIN ANALYZE SELECT u.name, o.oid, o.amount\n"
+        "FROM demo_users u JOIN demo_orders o ON u.id = o.uid\n"
+        "WHERE u.city = 'Harbin' AND o.amount >= 300\n"
+        "ORDER BY o.amount DESC;"
     ),
 }
 
@@ -479,6 +499,7 @@ class GuiController:
         self.db = Database(Path(data_dir).resolve())
         self.history: list[ExecutionEntry] = []
         self.last_tabular_result: QueryResult | None = None
+        self.last_plan_result: QueryResult | None = None
 
     @property
     def data_dir(self) -> Path:
@@ -488,6 +509,7 @@ class GuiController:
         """Switch to a different database directory cleanly without os.chdir()."""
         self.db = Database(Path(data_dir).resolve())
         self.last_tabular_result = None
+        self.last_plan_result = None
         return self.db.data_dir
 
     def get_completions(self, script: str, cursor_offset: int, manual: bool = False) -> CompletionResult | None:
@@ -637,17 +659,29 @@ class GuiController:
         )
 
     def get_metadata(self, filter_text: str = '') -> list[TableMeta]:
-        """Load table list with row counts and column definitions, optionally filtered."""
+        """Load table list with row counts, column definitions, and secondary indexes."""
         needle = filter_text.strip().lower()
         metas: list[TableMeta] = []
+        all_indexes = self.db.storage.list_indexes()
         for name, _, defs in self.db.list_tables():
             if needle and needle not in name.lower():
                 continue
             table = self.db.get_table(name)
             row_count = table.count_rows() if table else 0
             cols = tuple((col_name, col_type) for col_name, col_type in defs.items())
-            metas.append(TableMeta(name=name, row_count=row_count, columns=cols))
+            idxs = tuple((m.name, m.column_name) for m in all_indexes if m.table_name == name)
+            metas.append(TableMeta(name=name, row_count=row_count, columns=cols, indexes=idxs))
         return metas
+
+    def explain_sql(self, sql: str, analyze: bool = True) -> BatchExecutionReport:
+        """Run EXPLAIN [ANALYZE] against a single SQL statement."""
+        cleaned = sql.strip().rstrip(';').strip()
+        if not cleaned:
+            return BatchExecutionReport(entries=[], last_tabular=None, schema_changed=False, total_elapsed_ms=0.0, error_count=0)
+        if not re.match(r'^EXPLAIN\b', cleaned, re.IGNORECASE):
+            prefix = 'EXPLAIN ANALYZE ' if analyze else 'EXPLAIN '
+            cleaned = prefix + cleaned
+        return self.execute_script(cleaned + ';')
 
     def execute_script(self, script: str) -> BatchExecutionReport:
         """Execute one or more semicolon-separated SQL statements sequentially."""
@@ -670,6 +704,8 @@ class GuiController:
                 if res.is_tabular:
                     last_tabular = res
                     self.last_tabular_result = res
+                if res.kind == StatementKind.EXPLAIN and res.plan is not None:
+                    self.last_plan_result = res
                 if res.kind in (
                     StatementKind.DDL,
                     StatementKind.INSERT,

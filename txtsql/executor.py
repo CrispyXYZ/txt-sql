@@ -1,13 +1,15 @@
 """Statement executors: interpret AST and drive a StorageEngine instance."""
 
+import time
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
 from .ast import (
     DropTable, CreateTable, CreateIndex, DropIndex, InsertValues, InsertSelect,
     DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
-    ShowTables, ShowIndexes, DescribeTable,
+    ShowTables, ShowIndexes, DescribeTable, ExplainStatement,
     AggFunc, AggregateExpression, ColumnExpression, Expression, LiteralExpression, StarExpression,
     JoinClause, JoinType, SelectExpression,
     contains_aggregate,
@@ -19,6 +21,7 @@ from .evaluator import (
 from .exceptions import ColumnNotFoundError, TableAlreadyExistsError, TableNotFoundError, EngineError, TypeMismatchError
 from .index import match_single_table_index
 from .io_handlers import export_rows, read_excel_table
+from .lexer import Token
 from .optimizer import (
     EquiKeySpec,
     VisibleColumn,
@@ -26,6 +29,7 @@ from .optimizer import (
     extract_equi_join_keys,
     read_equi_key,
 )
+from .plan import PlanNode, flatten_plan_rows, serialize_ast_node, serialize_tokens
 from .result import QueryResult, StatementKind
 from .storage import StorageEngine, Table
 from .types import Types, RowDict, DataValue
@@ -37,7 +41,7 @@ Statement = (
     CreateTable | DropTable | CreateIndex | DropIndex |
     InsertValues | InsertSelect | DeleteStatement |
     SelectStatement | UnionStatement | UpdateStatement |
-    ImportStatement | ShowTables | ShowIndexes | DescribeTable
+    ImportStatement | ShowTables | ShowIndexes | DescribeTable | ExplainStatement
 )
 
 
@@ -51,7 +55,7 @@ class QueryExecutor:
         self.storage = storage_engine
         self.enable_optimizations = enable_optimizations
 
-    def execute(self, statement: Statement) -> QueryResult:
+    def execute(self, statement: Statement, tokens: Sequence[Token] | None = None) -> QueryResult:
         """Dispatch any parsed statement AST and return a structured QueryResult."""
         match statement:
             case CreateTable():
@@ -82,6 +86,8 @@ class QueryExecutor:
                 return self.execute_show_indexes(statement)
             case DescribeTable():
                 return self.execute_describe(statement)
+            case ExplainStatement():
+                return self.execute_explain(statement, tokens=tokens)
             case _:
                 raise EngineError(f'Unsupported statement type: {type(statement)}')
 
@@ -265,6 +271,270 @@ class QueryExecutor:
             rows=rows,
         )
 
+    def execute_explain(
+        self,
+        statement: ExplainStatement,
+        tokens: Sequence[Token] | None = None,
+    ) -> QueryResult:
+        """Explain (and optionally analyze at runtime) a SELECT or UNION query plan."""
+        target = statement.query
+        if statement.analyze:
+            if isinstance(target, SelectStatement):
+                plan_node = self._analyze_select_plan(target)
+            else:
+                plan_node = self._analyze_union_plan(target)
+        else:
+            if isinstance(target, SelectStatement):
+                plan_node = self._build_static_select_plan(target)
+            else:
+                plan_node = self._build_static_union_plan(target)
+
+        cols, rows = flatten_plan_rows(plan_node, analyze=statement.analyze)
+        return QueryResult(
+            kind=StatementKind.EXPLAIN,
+            columns=cols,
+            rows=rows,
+            message='EXPLAIN ANALYZE completed.' if statement.analyze else 'EXPLAIN completed.',
+            plan=plan_node,
+            tokens_info=serialize_tokens(tokens or ()),
+            ast_tree=serialize_ast_node(target),
+        )
+
+    def _analyze_select_plan(self, statement: SelectStatement) -> PlanNode:
+        _, _, plan_node = self._build_select_rows_internal(statement, outer_row=None, collect_plan=True)
+        assert plan_node is not None
+        if statement.limit is not None or statement.offset > 0:
+            t0 = time.perf_counter()
+            r_in = plan_node.rows_out or 0
+            after_off = max(0, r_in - statement.offset) if statement.offset > 0 else r_in
+            r_out = min(after_off, statement.limit) if statement.limit is not None else after_off
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            plan_node = PlanNode(
+                operator='LimitOffset',
+                detail=f'LIMIT={statement.limit}, OFFSET={statement.offset}',
+                rows_in=r_in,
+                rows_out=r_out,
+                time_ms=elapsed,
+                children=(plan_node,),
+            )
+        return plan_node
+
+    def _analyze_union_plan(self, statement: UnionStatement) -> PlanNode:
+        t0 = time.perf_counter()
+        branch_plans: list[PlanNode] = []
+        first_stmt, _ = statement.branches[0]
+        combined, headers, first_plan = self._build_select_rows_internal(first_stmt, outer_row=None, collect_plan=True)
+        assert first_plan is not None
+        branch_plans.append(first_plan)
+        expected_cols = len(headers)
+        rows_in_total = len(combined)
+
+        for branch_stmt, is_all in statement.branches[1:]:
+            b_rows, b_headers, b_plan = self._build_select_rows_internal(branch_stmt, outer_row=None, collect_plan=True)
+            assert b_plan is not None
+            if len(b_headers) != expected_cols:
+                raise EngineError('The used SELECT statements have a different number of columns')
+            branch_plans.append(b_plan)
+            rows_in_total += len(b_rows)
+            rekeyed = [{h: v for h, v in zip(headers, r.values())} for r in b_rows]
+            if is_all:
+                combined.extend(rekeyed)
+            else:
+                combined = _dedup_rows(combined + rekeyed)
+
+        union_ms = (time.perf_counter() - t0) * 1000.0
+        node = PlanNode(
+            operator='Union',
+            detail=f'{len(statement.branches)} branches',
+            rows_in=rows_in_total,
+            rows_out=len(combined),
+            time_ms=union_ms,
+            children=tuple(branch_plans),
+        )
+        if statement.order_by:
+            t_sort = time.perf_counter()
+            pairs = [(r, r) for r in combined]
+            pairs = _order_pairs(pairs, statement.order_by, valid_single_qualifier=None)
+            combined = [proj_r for _, proj_r in pairs]
+            sort_detail = ', '.join(
+                f'{col.column_name} {"DESC" if desc else "ASC"}' for col, desc in statement.order_by
+            )
+            node = PlanNode(
+                operator='Sort',
+                detail=sort_detail,
+                rows_in=len(combined),
+                rows_out=len(combined),
+                time_ms=(time.perf_counter() - t_sort) * 1000.0,
+                children=(node,),
+            )
+        if statement.limit is not None or statement.offset > 0:
+            r_in = len(combined)
+            r_out = len(combined[statement.offset:statement.offset + statement.limit] if statement.limit is not None else combined[statement.offset:])
+            node = PlanNode(
+                operator='LimitOffset',
+                detail=f'LIMIT={statement.limit}, OFFSET={statement.offset}',
+                rows_in=r_in,
+                rows_out=r_out,
+                time_ms=0.0,
+                children=(node,),
+            )
+        return node
+
+    def _build_static_union_plan(self, statement: UnionStatement) -> PlanNode:
+        branch_plans = tuple(self._build_static_select_plan(b_stmt) for b_stmt, _ in statement.branches)
+        node = PlanNode(
+            operator='Union',
+            detail=f'{len(statement.branches)} branches',
+            children=branch_plans,
+        )
+        if statement.order_by:
+            sort_detail = ', '.join(
+                f'{col.column_name} {"DESC" if desc else "ASC"}' for col, desc in statement.order_by
+            )
+            node = PlanNode(operator='Sort', detail=sort_detail, children=(node,))
+        if statement.limit is not None or statement.offset > 0:
+            node = PlanNode(
+                operator='LimitOffset',
+                detail=f'LIMIT={statement.limit}, OFFSET={statement.offset}',
+                children=(node,),
+            )
+        return node
+
+    def _build_static_select_plan(self, statement: SelectStatement) -> PlanNode:
+        prep = self._prepare_select_context(statement)
+        sources = statement.sources
+        src_tables = prep['src_tables']
+        join_tables = prep['join_tables']
+        alias_table_map = prep['alias_table_map']
+        table_columns_map = prep['table_columns_map']
+        use_prefixes = prep['use_prefixes']
+        single_qualifier = prep['single_qualifier']
+
+        residual_where = statement.where_clause.expression if statement.where_clause is not None else None
+        source_preds: dict[str, Expression] = {}
+        active_joins = statement.joins
+        rewritten_count = 0
+
+        def _static_scan(table: Table, alias: str, pred: Expression | None, pushed: bool) -> PlanNode:
+            if self.enable_optimizations and pred is not None:
+                idx_match = match_single_table_index(pred, self.storage.get_table_indexes(table), single_qualifier=alias)
+                if idx_match is not None:
+                    node = PlanNode(
+                        operator='IndexScan',
+                        detail=idx_match.detail,
+                        optimization='Index Scan',
+                    )
+                    if idx_match.residual_expr is not None:
+                        node = PlanNode(
+                            operator='Filter',
+                            detail=f'{alias} residual filter',
+                            optimization='Predicate Pushdown' if pushed else '',
+                            children=(node,),
+                        )
+                    return node
+            node = PlanNode(operator='TableScan', detail=f'{table.name} AS {alias}')
+            if pred is not None:
+                node = PlanNode(
+                    operator='Filter',
+                    detail=f'{alias} filter',
+                    optimization='Predicate Pushdown' if pushed else '',
+                    children=(node,),
+                )
+            return node
+
+        if use_prefixes:
+            if self.enable_optimizations:
+                pushdown = analyze_predicate_pushdown(
+                    residual_where, sources, statement.joins, table_columns_map,
+                    using_or_natural_cols=prep['merged_cols'],
+                )
+                source_preds = pushdown.source_predicates
+                active_joins = pushdown.rewritten_joins
+                residual_where = pushdown.residual_where
+                rewritten_count = pushdown.rewritten_implicit_joins
+
+                first_alias = sources[0].alias or sources[0].name
+                cur_plan = _static_scan(src_tables[0], first_alias, source_preds.get(first_alias), pushed=first_alias in source_preds)
+                vis_cols = [_VisibleColumn(first_alias, c, f'{first_alias}.{c}') for c in src_tables[0].column_names()]
+            else:
+                first_alias = sources[0].alias or sources[0].name
+                cur_plan = _static_scan(src_tables[0], first_alias, None, pushed=False)
+                vis_cols = [_VisibleColumn(first_alias, c, f'{first_alias}.{c}') for c in src_tables[0].column_names()]
+                for s_extra, t_extra in zip(sources[1:], src_tables[1:]):
+                    e_alias = s_extra.alias or s_extra.name
+                    right_plan = _static_scan(t_extra, e_alias, None, pushed=False)
+                    cur_plan = PlanNode(
+                        operator='CartesianProduct',
+                        detail=f'{e_alias}',
+                        children=(cur_plan, right_plan),
+                    )
+                    vis_cols.extend(_VisibleColumn(e_alias, c, f'{e_alias}.{c}') for c in t_extra.column_names())
+
+            for idx_j, jc in enumerate(active_joins):
+                j_alias = jc.source.alias or jc.source.name
+                j_table = alias_table_map[j_alias]
+                r_cols = [_VisibleColumn(j_alias, c, f'{j_alias}.{c}') for c in j_table.column_names()]
+                r_plan = _static_scan(j_table, j_alias, source_preds.get(j_alias), pushed=j_alias in source_preds)
+                common = _common_join_columns(vis_cols, r_cols, jc)
+                equi_pairs, _ = (
+                    extract_equi_join_keys(vis_cols, r_cols, jc, common)
+                    if (self.enable_optimizations and jc.join_type != JoinType.CROSS)
+                    else ([], None)
+                )
+                is_implicit = idx_j < max(0, len(active_joins) - len(statement.joins)) and rewritten_count > 0
+                if jc.join_type == JoinType.CROSS:
+                    cur_plan = PlanNode(operator='CrossJoin', detail=f'{j_table.name} AS {j_alias}', children=(cur_plan, r_plan))
+                elif equi_pairs:
+                    opt = 'Hash Join, Implicit Join Rewrite' if is_implicit else 'Hash Join'
+                    cur_plan = PlanNode(
+                        operator='HashJoin',
+                        detail=f'{jc.join_type.value} JOIN {j_table.name} AS {j_alias} (keys={len(equi_pairs)})',
+                        optimization=opt,
+                        children=(cur_plan, r_plan),
+                    )
+                else:
+                    cur_plan = PlanNode(
+                        operator='NestedLoopJoin',
+                        detail=f'{jc.join_type.value} JOIN {j_table.name} AS {j_alias}',
+                        children=(cur_plan, r_plan),
+                    )
+                vis_cols = _visible_after_join(vis_cols, r_cols, jc, common)
+        else:
+            first_alias = single_qualifier or src_tables[0].name
+            cur_plan = _static_scan(src_tables[0], first_alias, residual_where, pushed=False)
+            residual_where = None
+
+        if residual_where is not None:
+            cur_plan = PlanNode(operator='Filter', detail='WHERE filter', children=(cur_plan,))
+
+        expanded_columns = (
+            _expand_select_expressions(
+                statement.columns, src_tables[0].column_names(), table_columns_map,
+                prep['initial_visible'] if not use_prefixes else vis_cols, use_prefixes,
+            )
+            if statement.columns is not None else None
+        )
+        has_agg = expanded_columns is not None and any(contains_aggregate(se.expr) for se in expanded_columns)
+        has_having_agg = statement.having is not None and contains_aggregate(statement.having.expression)
+        is_grouped = has_agg or statement.group_by is not None or has_having_agg
+
+        if is_grouped:
+            gb_detail = ', '.join(c.column_name for c in statement.group_by) if statement.group_by else 'global aggregate'
+            cur_plan = PlanNode(operator='GroupAggregate', detail=gb_detail, children=(cur_plan,))
+            if statement.having is not None:
+                cur_plan = PlanNode(operator='Having', detail='HAVING filter', children=(cur_plan,))
+        else:
+            proj_detail = f'{len(expanded_columns)} expr(s)' if expanded_columns is not None else '*'
+            cur_plan = PlanNode(operator='Project', detail=proj_detail, children=(cur_plan,))
+
+        if statement.distinct:
+            cur_plan = PlanNode(operator='Distinct', detail='deduplicate', children=(cur_plan,))
+        if statement.order_by:
+            sort_detail = ', '.join(f'{c.column_name} {"DESC" if d else "ASC"}' for c, d in statement.order_by)
+            cur_plan = PlanNode(operator='Sort', detail=sort_detail, children=(cur_plan,))
+        if statement.limit is not None or statement.offset > 0:
+            cur_plan = PlanNode(operator='LimitOffset', detail=f'LIMIT={statement.limit}, OFFSET={statement.offset}', children=(cur_plan,))
+        return cur_plan
     def execute_describe(self, statement: DescribeTable) -> QueryResult:
         table = self.storage.get_table(statement.table_name)
         if table is None:
@@ -399,11 +669,16 @@ class QueryExecutor:
         predicate: Expression | None,
         outer_row: RowDict | None,
         copy_rows: bool = True,
-    ) -> tuple[list[RowDict], Expression | None]:
+        collect_plan: bool = False,
+        pushed: bool = False,
+    ) -> tuple[list[RowDict], Expression | None, PlanNode | None]:
         """Scan a single table, leveraging secondary index access if enabled and matched."""
+        t0 = time.perf_counter() if collect_plan else 0.0
         all_rows = self.storage.get_table_rows(table)
+        total_rows = len(all_rows)
         residual = predicate
         selected: list[RowDict]
+        plan_node: PlanNode | None = None
 
         if self.enable_optimizations and predicate is not None:
             table_indexes = self.storage.get_table_indexes(table)
@@ -411,12 +686,39 @@ class QueryExecutor:
             if idx_match is not None:
                 selected = [dict(all_rows[rid]) if copy_rows else all_rows[rid] for rid in idx_match.row_ids]
                 residual = idx_match.residual_expr
+                if collect_plan:
+                    plan_node = PlanNode(
+                        operator='IndexScan',
+                        detail=idx_match.detail,
+                        optimization='Index Scan',
+                        rows_in=total_rows,
+                        rows_out=len(selected),
+                        time_ms=(time.perf_counter() - t0) * 1000.0,
+                    )
             else:
                 selected = [dict(r) for r in all_rows] if copy_rows else all_rows
+                if collect_plan:
+                    plan_node = PlanNode(
+                        operator='TableScan',
+                        detail=f'{table.name} AS {alias}',
+                        rows_in=total_rows,
+                        rows_out=total_rows,
+                        time_ms=(time.perf_counter() - t0) * 1000.0,
+                    )
         else:
             selected = [dict(r) for r in all_rows] if copy_rows else all_rows
+            if collect_plan:
+                plan_node = PlanNode(
+                    operator='TableScan',
+                    detail=f'{table.name} AS {alias}',
+                    rows_in=total_rows,
+                    rows_out=total_rows,
+                    time_ms=(time.perf_counter() - t0) * 1000.0,
+                )
 
         if residual is not None:
+            t_f = time.perf_counter() if collect_plan else 0.0
+            before_f = len(selected)
             ctx = EvalContext(
                 table_defs=table.column_types(),
                 subquery_exec=self._exec_subquery,
@@ -426,15 +728,20 @@ class QueryExecutor:
             where_func = evaluate_where(residual, ctx)
             selected = [r for r in selected if where_func(r)]
             residual = None
+            if collect_plan and plan_node is not None:
+                plan_node = PlanNode(
+                    operator='Filter',
+                    detail=f'{alias} filter',
+                    optimization='Predicate Pushdown' if pushed else '',
+                    rows_in=before_f,
+                    rows_out=len(selected),
+                    time_ms=(time.perf_counter() - t_f) * 1000.0,
+                    children=(plan_node,),
+                )
 
-        return selected, residual
+        return selected, residual, plan_node
 
-    def _build_select_rows(
-        self,
-        statement: SelectStatement,
-        outer_row: RowDict | None = None,
-    ) -> tuple[list[RowDict], list[str]]:
-        """Execute the core SELECT pipeline up through ORDER BY (before LIMIT/OFFSET)."""
+    def _prepare_select_context(self, statement: SelectStatement) -> dict:
         sources = statement.sources
         src_tables = [self._get_table(src.name) for src in sources]
 
@@ -467,43 +774,82 @@ class QueryExecutor:
         for t in tables:
             all_defs.update(t.column_types())
 
+        merged_cols: set[str] = set()
+        seen_col_names = set(src_tables[0].column_names())
+        for s_t in src_tables[1:]:
+            seen_col_names.update(s_t.column_names())
+        for jc, jt in zip(statement.joins, join_tables):
+            if jc.using_columns:
+                merged_cols.update(jc.using_columns)
+            elif jc.natural:
+                merged_cols.update(seen_col_names & set(jt.column_names()))
+            seen_col_names.update(jt.column_names())
+
         use_prefixes = len(sources) > 1 or bool(statement.joins)
         single_qualifier = (sources[0].alias or sources[0].name) if not use_prefixes else None
+        return {
+            'src_tables': src_tables,
+            'join_tables': join_tables,
+            'tables': tables,
+            'alias_table_map': alias_table_map,
+            'table_columns_map': table_columns_map,
+            'all_defs': all_defs,
+            'merged_cols': merged_cols,
+            'use_prefixes': use_prefixes,
+            'single_qualifier': single_qualifier,
+            'initial_visible': None,
+        }
+
+    def _build_select_rows(
+        self,
+        statement: SelectStatement,
+        outer_row: RowDict | None = None,
+    ) -> tuple[list[RowDict], list[str]]:
+        rows, headers, _ = self._build_select_rows_internal(statement, outer_row=outer_row, collect_plan=False)
+        return rows, headers
+
+    def _build_select_rows_internal(
+        self,
+        statement: SelectStatement,
+        outer_row: RowDict | None = None,
+        collect_plan: bool = False,
+    ) -> tuple[list[RowDict], list[str], PlanNode | None]:
+        """Execute the core SELECT pipeline up through ORDER BY (optionally collecting PlanNode)."""
+        prep = self._prepare_select_context(statement)
+        sources = statement.sources
+        src_tables = prep['src_tables']
+        alias_table_map = prep['alias_table_map']
+        table_columns_map = prep['table_columns_map']
+        all_defs = prep['all_defs']
+        use_prefixes = prep['use_prefixes']
+        single_qualifier = prep['single_qualifier']
 
         combined: list[RowDict] = []
         visible_columns: list[_VisibleColumn] | None = None
         residual_where = statement.where_clause.expression if statement.where_clause is not None else None
+        cur_plan: PlanNode | None = None
 
         if use_prefixes:
             source_preds: dict[str, Expression] = {}
             if self.enable_optimizations:
-                merged_cols: set[str] = set()
-                seen_col_names = set(src_tables[0].column_names())
-                for s_t in src_tables[1:]:
-                    seen_col_names.update(s_t.column_names())
-                for jc, jt in zip(statement.joins, join_tables):
-                    if jc.using_columns:
-                        merged_cols.update(jc.using_columns)
-                    elif jc.natural:
-                        jcols = set(jt.column_names())
-                        merged_cols.update(seen_col_names & jcols)
-                    seen_col_names.update(jt.column_names())
-
                 pushdown = analyze_predicate_pushdown(
                     residual_where,
                     sources,
                     statement.joins,
                     table_columns_map,
-                    using_or_natural_cols=merged_cols,
+                    using_or_natural_cols=prep['merged_cols'],
                 )
                 source_preds = pushdown.source_predicates
                 active_joins = pushdown.rewritten_joins
                 residual_where = pushdown.residual_where
+                rewritten_count = pushdown.rewritten_implicit_joins
 
                 first_src = sources[0]
                 first_alias = first_src.alias or first_src.name
-                first_rows, _ = self._scan_table_rows(
-                    src_tables[0], first_alias, source_preds.get(first_alias), outer_row, copy_rows=False,
+                first_rows, _, cur_plan = self._scan_table_rows(
+                    src_tables[0], first_alias, source_preds.get(first_alias),
+                    outer_row, copy_rows=False, collect_plan=collect_plan,
+                    pushed=first_alias in source_preds,
                 )
                 combined = [_prefix_row(r, first_alias) for r in first_rows]
                 visible_columns = [
@@ -512,6 +858,8 @@ class QueryExecutor:
                 ]
             else:
                 active_joins = statement.joins
+                rewritten_count = 0
+                t_c = time.perf_counter() if collect_plan else 0.0
                 rows_per_table = [self.storage.get_table_rows(table) for table in src_tables]
                 for combo in _cartesian_product(rows_per_table):
                     row: RowDict = {}
@@ -525,25 +873,73 @@ class QueryExecutor:
                     visible_columns.extend(
                         _VisibleColumn(alias, col, f"{alias}.{col}") for col in table.column_names()
                     )
+                if collect_plan:
+                    first_alias = sources[0].alias or sources[0].name
+                    cur_plan = PlanNode(
+                        operator='TableScan',
+                        detail=f'{src_tables[0].name} AS {first_alias}',
+                        rows_in=len(rows_per_table[0]),
+                        rows_out=len(rows_per_table[0]),
+                        time_ms=0.0,
+                    )
+                    for s_e, t_e, r_e in zip(sources[1:], src_tables[1:], rows_per_table[1:]):
+                        ea = s_e.alias or s_e.name
+                        rp = PlanNode(operator='TableScan', detail=f'{t_e.name} AS {ea}', rows_in=len(r_e), rows_out=len(r_e), time_ms=0.0)
+                        cur_plan = PlanNode(
+                            operator='CartesianProduct',
+                            detail=ea,
+                            rows_in=len(combined),
+                            rows_out=len(combined),
+                            time_ms=(time.perf_counter() - t_c) * 1000.0,
+                            children=(cur_plan, rp),
+                        )
 
-            for jc in active_joins:
+            for idx_j, jc in enumerate(active_joins):
                 join_alias = jc.source.alias or jc.source.name
                 join_table = alias_table_map[join_alias]
                 right_columns = [
                     _VisibleColumn(join_alias, col, f"{join_alias}.{col}")
                     for col in join_table.column_names()
                 ]
-                scanned_right, _ = self._scan_table_rows(
-                    join_table, join_alias, source_preds.get(join_alias), outer_row, copy_rows=False,
+                scanned_right, _, right_plan = self._scan_table_rows(
+                    join_table, join_alias, source_preds.get(join_alias),
+                    outer_row, copy_rows=False, collect_plan=collect_plan,
+                    pushed=join_alias in source_preds,
                 )
                 right_rows = [_prefix_row(r, join_alias) for r in scanned_right]
-                combined, visible_columns = self._apply_join(
+                left_count = len(combined)
+                t_j = time.perf_counter() if collect_plan else 0.0
+                combined, visible_columns, used_hash, key_count = self._apply_join_with_info(
                     combined, visible_columns, right_rows, right_columns, jc,
                     outer_row=outer_row,
                 )
+                if collect_plan and cur_plan is not None and right_plan is not None:
+                    is_implicit = idx_j < max(0, len(active_joins) - len(statement.joins)) and rewritten_count > 0
+                    if jc.join_type == JoinType.CROSS:
+                        op = 'CrossJoin'
+                        opt = ''
+                        det = f'{join_table.name} AS {join_alias}'
+                    elif used_hash:
+                        op = 'HashJoin'
+                        opt = 'Hash Join, Implicit Join Rewrite' if is_implicit else 'Hash Join'
+                        det = f'{jc.join_type.value} JOIN {join_table.name} AS {join_alias} (keys={key_count})'
+                    else:
+                        op = 'NestedLoopJoin'
+                        opt = ''
+                        det = f'{jc.join_type.value} JOIN {join_table.name} AS {join_alias}'
+                    cur_plan = PlanNode(
+                        operator=op,
+                        detail=det,
+                        optimization=opt,
+                        rows_in=left_count + len(right_rows),
+                        rows_out=len(combined),
+                        time_ms=(time.perf_counter() - t_j) * 1000.0,
+                        children=(cur_plan, right_plan),
+                    )
         else:
-            combined, _ = self._scan_table_rows(
-                src_tables[0], single_qualifier or src_tables[0].name, residual_where, outer_row, copy_rows=True,
+            combined, _, cur_plan = self._scan_table_rows(
+                src_tables[0], single_qualifier or src_tables[0].name, residual_where,
+                outer_row, copy_rows=True, collect_plan=collect_plan, pushed=False,
             )
             residual_where = None
 
@@ -556,13 +952,24 @@ class QueryExecutor:
 
         # Remaining WHERE applies after FROM/JOIN construction.
         if residual_where is not None:
+            t_w = time.perf_counter() if collect_plan else 0.0
+            before_w = len(combined)
             where_func = evaluate_where(residual_where, base_ctx)
             combined = [r for r in combined if where_func(r)]
+            if collect_plan and cur_plan is not None:
+                cur_plan = PlanNode(
+                    operator='Filter',
+                    detail='WHERE filter',
+                    rows_in=before_w,
+                    rows_out=len(combined),
+                    time_ms=(time.perf_counter() - t_w) * 1000.0,
+                    children=(cur_plan,),
+                )
 
         expanded_columns = (
             _expand_select_expressions(
                 statement.columns,
-                tables[0].column_names(),
+                src_tables[0].column_names(),
                 table_columns_map,
                 visible_columns,
                 use_prefixes,
@@ -580,6 +987,8 @@ class QueryExecutor:
         paired: list[tuple[RowDict, RowDict]] = []
 
         if not is_grouped:
+            t_p = time.perf_counter() if collect_plan else 0.0
+            before_p = len(combined)
             if expanded_columns is not None:
                 for row in combined:
                     proj = _project_select_expressions(row, expanded_columns, base_ctx)
@@ -589,8 +998,22 @@ class QueryExecutor:
                 paired = list(zip(combined, projected))
             else:
                 paired = [(row, dict(row)) for row in combined]
+            if collect_plan and cur_plan is not None:
+                proj_detail = f'{len(expanded_columns)} expr(s)' if expanded_columns is not None else '*'
+                cur_plan = PlanNode(
+                    operator='Project',
+                    detail=proj_detail,
+                    rows_in=before_p,
+                    rows_out=len(paired),
+                    time_ms=(time.perf_counter() - t_p) * 1000.0,
+                    children=(cur_plan,),
+                )
         else:
+            t_g = time.perf_counter() if collect_plan else 0.0
+            before_g = len(combined)
             groups = _group_rows(combined, statement.group_by, single_qualifier)
+            after_g = len(groups)
+            having_kept: list[tuple[RowDict, RowDict]] = []
             for _, rep_row, group_rows in groups:
                 def _agg_eval(agg_expr: AggregateExpression, _gr=group_rows) -> DataValue:
                     return _eval_aggregate(agg_expr, _gr, single_qualifier)
@@ -607,10 +1030,33 @@ class QueryExecutor:
                     if not to_bool(evaluate_expression(statement.having.expression, having_row, group_ctx)):
                         continue
 
-                paired.append((rep_row, proj))
+                having_kept.append((rep_row, proj))
+            paired = having_kept
+            if collect_plan and cur_plan is not None:
+                gb_detail = ', '.join(c.column_name for c in statement.group_by) if statement.group_by else 'global aggregate'
+                total_g_ms = (time.perf_counter() - t_g) * 1000.0
+                cur_plan = PlanNode(
+                    operator='GroupAggregate',
+                    detail=gb_detail,
+                    rows_in=before_g,
+                    rows_out=after_g,
+                    time_ms=total_g_ms,
+                    children=(cur_plan,),
+                )
+                if statement.having is not None:
+                    cur_plan = PlanNode(
+                        operator='Having',
+                        detail='HAVING filter',
+                        rows_in=after_g,
+                        rows_out=len(paired),
+                        time_ms=0.0,
+                        children=(cur_plan,),
+                    )
 
         # DISTINCT (dedup on projected row)
         if statement.distinct:
+            t_d = time.perf_counter() if collect_plan else 0.0
+            before_d = len(paired)
             seen = set()
             unique_pairs: list[tuple[RowDict, RowDict]] = []
             for raw_r, proj_r in paired:
@@ -619,10 +1065,31 @@ class QueryExecutor:
                     seen.add(key)
                     unique_pairs.append((raw_r, proj_r))
             paired = unique_pairs
+            if collect_plan and cur_plan is not None:
+                cur_plan = PlanNode(
+                    operator='Distinct',
+                    detail='deduplicate',
+                    rows_in=before_d,
+                    rows_out=len(paired),
+                    time_ms=(time.perf_counter() - t_d) * 1000.0,
+                    children=(cur_plan,),
+                )
 
         # ORDER BY (resolve against projected row first, then raw/group row)
         if statement.order_by:
+            t_s = time.perf_counter() if collect_plan else 0.0
+            before_s = len(paired)
             paired = _order_pairs(paired, statement.order_by, single_qualifier)
+            if collect_plan and cur_plan is not None:
+                sort_detail = ', '.join(f'{c.column_name} {"DESC" if d else "ASC"}' for c, d in statement.order_by)
+                cur_plan = PlanNode(
+                    operator='Sort',
+                    detail=sort_detail,
+                    rows_in=before_s,
+                    rows_out=len(paired),
+                    time_ms=(time.perf_counter() - t_s) * 1000.0,
+                    children=(cur_plan,),
+                )
 
         result = [proj_r for _, proj_r in paired]
 
@@ -633,9 +1100,9 @@ class QueryExecutor:
         elif visible_columns is not None:
             headers = _compute_star_headers(visible_columns)
         else:
-            headers = tables[0].column_names()
+            headers = src_tables[0].column_names()
 
-        return result, headers
+        return result, headers, cur_plan
 
     def _apply_join(
         self,
@@ -646,12 +1113,28 @@ class QueryExecutor:
         jc: JoinClause,
         outer_row: RowDict | None = None,
     ) -> tuple[list[RowDict], list[_VisibleColumn]]:
+        rows, cols, _, _ = self._apply_join_with_info(
+            left_rows, left_columns, right_rows, right_columns, jc, outer_row=outer_row,
+        )
+        return rows, cols
+
+    def _apply_join_with_info(
+        self,
+        left_rows: list[RowDict],
+        left_columns: list[_VisibleColumn],
+        right_rows: list[RowDict],
+        right_columns: list[_VisibleColumn],
+        jc: JoinClause,
+        outer_row: RowDict | None = None,
+    ) -> tuple[list[RowDict], list[_VisibleColumn], bool, int]:
         """Apply one JOIN clause using Hash Join for equi-joins (when enabled) or Nested Loop."""
         common = _common_join_columns(left_columns, right_columns, jc)
         null_right = {col.key: None for col in right_columns}
         null_left = {col.key: None for col in left_columns}
         new_rows: list[RowDict] = []
         matched_right: set[int] = set()
+        used_hash = False
+        key_count = 0
 
         if jc.join_type == JoinType.CROSS:
             for left_row in left_rows:
@@ -664,6 +1147,8 @@ class QueryExecutor:
                 equi_pairs, residual_cond = extract_equi_join_keys(left_columns, right_columns, jc, common)
 
             if equi_pairs:
+                used_hash = True
+                key_count = len(equi_pairs)
                 new_rows = self._hash_join(
                     left_rows, right_rows, equi_pairs, residual_cond,
                     jc.join_type, null_left, null_right, outer_row,
@@ -694,7 +1179,7 @@ class QueryExecutor:
                 for col in coalesced_cols:
                     row[col.name] = _coalesced_value(row, col)
 
-        return new_rows, visible
+        return new_rows, visible, used_hash, key_count
 
     def _hash_join(
         self,

@@ -10,7 +10,7 @@ from .ast import (
     WhereClause, SelectExpression, TableSource,
     CreateTable, DropTable, InsertValues, InsertSelect,
     DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
-    ShowTables, DescribeTable, CreateIndex, DropIndex, ShowIndexes,
+    ShowTables, ShowIndexes, DescribeTable, CreateIndex, DropIndex, ExplainStatement,
     contains_aggregate, collect_non_agg_columns,
 )
 from .exceptions import SqlSyntaxError
@@ -44,7 +44,7 @@ class Parser:
     # Top-level dispatch
     # ------------------------------------------------------------------
 
-    def parse(self) -> CreateTable | DropTable | CreateIndex | DropIndex | InsertValues | InsertSelect | DeleteStatement | SelectStatement | UnionStatement | UpdateStatement | ImportStatement | ShowTables | ShowIndexes | DescribeTable:
+    def parse(self) -> CreateTable | DropTable | CreateIndex | DropIndex | InsertValues | InsertSelect | DeleteStatement | SelectStatement | UnionStatement | UpdateStatement | ImportStatement | ShowTables | ShowIndexes | DescribeTable | ExplainStatement:
         token = self.current_token()
         match token.type:
             case TokenType.CREATE:   stmt = self.create_statement()
@@ -56,6 +56,7 @@ class Parser:
             case TokenType.IMPORT:   stmt = self.import_statement()
             case TokenType.SHOW:     stmt = self.show_statement()
             case TokenType.DESCRIBE: stmt = self.describe()
+            case TokenType.EXPLAIN:  stmt = self.explain_statement()
             case _: raise SqlSyntaxError(f'Unexpected statement: {token.type}')
 
         if self.current_token().type == TokenType.SEMICOLON:
@@ -841,6 +842,17 @@ class Parser:
         self.eat(TokenType.DESCRIBE)
         table_name = self.eat(TokenType.IDENTIFIER).value
         return DescribeTable(table_name)
+
+    def explain_statement(self) -> ExplainStatement:
+        self.eat(TokenType.EXPLAIN)
+        analyze = False
+        if self.current_token().type == TokenType.ANALYZE:
+            self.eat(TokenType.ANALYZE)
+            analyze = True
+        if self.current_token().type != TokenType.SELECT:
+            raise SqlSyntaxError('EXPLAIN only supports SELECT and UNION statements')
+        query = self.select_or_union(allow_outfile=False)
+        return ExplainStatement(query=query, analyze=analyze)
 
 
 # ----------------------------------------------------------------------

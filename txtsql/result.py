@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from .plan import PlanNode
 from .types import RowDict
 
 
@@ -16,6 +17,7 @@ class StatementKind(StrEnum):
     SYSTEM = 'SYSTEM'
     IMPORT = 'IMPORT'
     EXPORT = 'EXPORT'
+    EXPLAIN = 'EXPLAIN'
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,11 +28,19 @@ class QueryResult:
     rows: list[RowDict] = field(default_factory=list)
     affected_rows: int | None = None
     message: str = 'Query OK.'
+    plan: PlanNode | None = None
+    tokens_info: tuple[tuple[str, str, int, int], ...] = ()
+    ast_tree: dict | None = None
 
     @property
     def is_tabular(self) -> bool:
         """Whether this result represents tabular data (even if 0 rows)."""
-        return self.kind in (StatementKind.SELECT, StatementKind.UNION, StatementKind.SYSTEM)
+        return self.kind in (
+            StatementKind.SELECT,
+            StatementKind.UNION,
+            StatementKind.SYSTEM,
+            StatementKind.EXPLAIN,
+        )
 
     def to_legacy(self) -> list[RowDict] | int | None:
         """Convert to the legacy execute_sql() return value for backward compatibility."""

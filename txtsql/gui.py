@@ -12,10 +12,10 @@ from tkinter import filedialog, messagebox, ttk
 
 from .exceptions import TxtSqlError
 from .gui_controller import (
-    DEMO_TEMPLATES,
     SQL_KEYWORDS,
     CompletionItem,
     CompletionResult,
+    DEMO_TEMPLATES,
     ExecutionEntry,
     GuiController,
     StatementSpan,
@@ -25,6 +25,7 @@ from .gui_controller import (
     format_cell_single_line,
     sort_rows_for_view,
 )
+from .plan import PlanNode, collect_plan_optimizations, flatten_plan_rows
 from .result import QueryResult, StatementKind
 
 
@@ -332,6 +333,7 @@ class TxtSqlApp:
 
         run_menu = tk.Menu(menubar, tearoff=0)
         run_menu.add_command(label='运行当前语句', accelerator='Ctrl+Enter', command=self._run_current_statement)
+        run_menu.add_command(label='剖析执行计划 (EXPLAIN ANALYZE)', accelerator='Ctrl+E', command=self._explain_current_statement)
         run_menu.add_command(label='运行全部语句', accelerator='F5', command=self._run_all)
         run_menu.add_command(label='运行选中语句', accelerator='Ctrl+Shift+Enter', command=self._run_selected)
         run_menu.add_separator()
@@ -367,6 +369,7 @@ class TxtSqlApp:
         row2 = ttk.Frame(container)
         row2.pack(fill='x')
         ttk.Button(row2, text='▶ 运行当前 (Ctrl+Enter)', style='Accent.TButton', command=self._run_current_statement).pack(side='left', padx=(0, 4))
+        ttk.Button(row2, text='🔍 剖析计划 (Ctrl+E)', command=self._explain_current_statement).pack(side='left', padx=2)
         ttk.Button(row2, text='运行全部 (F5)', command=self._run_all).pack(side='left', padx=2)
         ttk.Button(row2, text='运行选中', command=self._run_selected).pack(side='left', padx=2)
         ttk.Button(row2, text='清空', command=self._clear_editor).pack(side='left', padx=2)
@@ -494,6 +497,7 @@ class TxtSqlApp:
         self.sql_text.bind('<Control-space>', lambda _e: self._on_ctrl_space())
         self.sql_text.bind('<Control-Return>', lambda _e: self._on_ctrl_return())
         self.sql_text.bind('<Control-Shift-Return>', lambda _e: self._on_ctrl_shift_return())
+        self.sql_text.bind('<Control-e>', lambda _e: self._on_ctrl_e())
         self.sql_text.bind('<Up>', lambda _e: self._on_popup_nav(-1))
         self.sql_text.bind('<Down>', lambda _e: self._on_popup_nav(1))
         self.sql_text.bind('<Return>', lambda _e: self._on_popup_accept())
@@ -616,6 +620,87 @@ class TxtSqlApp:
         self.log_text.tag_configure('INFO', foreground='#1e293b')
         self.log_text.tag_configure('DEBUG', foreground='#64748b')
 
+        # Tab 5: 执行计划与可视化
+        plan_tab = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(plan_tab, text='执行计划与可视化')
+        plan_hdr = ttk.Frame(plan_tab)
+        plan_hdr.pack(fill='x', pady=(0, 4))
+        self.plan_summary_var = tk.StringVar(value='选中一条 SELECT/UNION 语句，按 Ctrl+E 或点击「剖析计划」即可查看算子流水线与语法树')
+        ttk.Label(plan_hdr, textvariable=self.plan_summary_var, foreground='#334155').pack(side='left')
+
+        self.plan_notebook = ttk.Notebook(plan_tab)
+        self.plan_notebook.pack(fill='both', expand=True)
+
+        # Sub-tab 5.1: 算子执行流水线画布
+        pipe_tab = ttk.Frame(self.plan_notebook, padding=2)
+        self.plan_notebook.add(pipe_tab, text='算子流水线视图')
+        canvas_wrap = ttk.Frame(pipe_tab)
+        canvas_wrap.pack(fill='both', expand=True)
+        self.plan_canvas = tk.Canvas(canvas_wrap, background='#f8fafc', highlightthickness=0)
+        p_vsb = ttk.Scrollbar(canvas_wrap, orient='vertical', command=self.plan_canvas.yview)
+        p_hsb = ttk.Scrollbar(pipe_tab, orient='horizontal', command=self.plan_canvas.xview)
+        self.plan_canvas.configure(yscrollcommand=p_vsb.set, xscrollcommand=p_hsb.set)
+        self.plan_canvas.pack(side='left', fill='both', expand=True)
+        p_vsb.pack(side='right', fill='y')
+        p_hsb.pack(fill='x')
+
+        # Sub-tab 5.2: 算子性能明细表
+        detail_tab = ttk.Frame(self.plan_notebook, padding=2)
+        self.plan_notebook.add(detail_tab, text='算子指标明细')
+        self.plan_tree = ttk.Treeview(
+            detail_tab,
+            columns=('plan', 'opt', 'detail', 'rows_in', 'rows_out', 'sel', 'time_ms'),
+            show='headings',
+            selectmode='browse',
+        )
+        for cid, cname, cw, anc in (
+            ('plan', '执行算子', 210, 'w'),
+            ('opt', '启用优化', 190, 'w'),
+            ('detail', '算子详情', 310, 'w'),
+            ('rows_in', '输入行数', 85, 'e'),
+            ('rows_out', '输出行数', 85, 'e'),
+            ('sel', '选择率', 80, 'e'),
+            ('time_ms', '耗时 (ms)', 90, 'e'),
+        ):
+            self.plan_tree.heading(cid, text=cname)
+            self.plan_tree.column(cid, width=cw, anchor=anc)
+        pt_vsb = ttk.Scrollbar(detail_tab, orient='vertical', command=self.plan_tree.yview)
+        self.plan_tree.configure(yscrollcommand=pt_vsb.set)
+        self.plan_tree.pack(side='left', fill='both', expand=True)
+        pt_vsb.pack(side='right', fill='y')
+
+        # Sub-tab 5.3: 词法 Token 与 AST 透视
+        ast_tab = ttk.Frame(self.plan_notebook, padding=2)
+        self.plan_notebook.add(ast_tab, text='词法 Token 与 AST 透视')
+        ast_pane = ttk.PanedWindow(ast_tab, orient='horizontal')
+        ast_pane.pack(fill='both', expand=True)
+
+        tok_frame = ttk.Frame(ast_pane, padding=2)
+        ttk.Label(tok_frame, text='词法记号流 (Lexer Tokens)', font=('TkDefaultFont', 9, 'bold')).pack(anchor='w', pady=(0, 3))
+        self.token_tree = ttk.Treeview(tok_frame, columns=('idx', 'type', 'val', 'pos'), show='headings', selectmode='browse')
+        for cid, cname, cw, anc in (
+            ('idx', '#', 45, 'center'),
+            ('type', 'Token 类型', 130, 'w'),
+            ('val', '字面值', 150, 'w'),
+            ('pos', '行:列', 75, 'center'),
+        ):
+            self.token_tree.heading(cid, text=cname)
+            self.token_tree.column(cid, width=cw, anchor=anc)
+        tok_vsb = ttk.Scrollbar(tok_frame, orient='vertical', command=self.token_tree.yview)
+        self.token_tree.configure(yscrollcommand=tok_vsb.set)
+        self.token_tree.pack(side='left', fill='both', expand=True)
+        tok_vsb.pack(side='right', fill='y')
+        ast_pane.add(tok_frame, weight=1)
+
+        tree_frame = ttk.Frame(ast_pane, padding=2)
+        ttk.Label(tree_frame, text='抽象语法树 (Parser AST)', font=('TkDefaultFont', 9, 'bold')).pack(anchor='w', pady=(0, 3))
+        self.ast_tree = ttk.Treeview(tree_frame, show='tree', selectmode='browse')
+        ast_vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.ast_tree.yview)
+        self.ast_tree.configure(yscrollcommand=ast_vsb.set)
+        self.ast_tree.pack(side='left', fill='both', expand=True)
+        ast_vsb.pack(side='right', fill='y')
+        ast_pane.add(tree_frame, weight=1)
+
     def _build_statusbar(self) -> None:
         ttk.Separator(self.root, orient='horizontal').pack(fill='x')
         bar = ttk.Frame(self.root, padding=(8, 3))
@@ -631,6 +716,7 @@ class TxtSqlApp:
         self.root.bind('<F5>', lambda _e: self._run_all())
         self.root.bind('<Control-Return>', lambda _e: self._on_ctrl_return())
         self.root.bind('<Control-Shift-Return>', lambda _e: self._on_ctrl_shift_return())
+        self.root.bind('<Control-e>', lambda _e: self._on_ctrl_e())
         self.root.bind('<Control-o>', lambda _e: self._choose_directory())
         self.root.bind('<Control-s>', lambda _e: self._save_sql_file())
         self.root.bind('<Control-l>', lambda _e: self._clear_editor())
@@ -682,6 +768,8 @@ class TxtSqlApp:
             self.meta_tree.insert('', 'end', iid=table_iid, text=f'{meta.name} ({meta.row_count} 行)', open=False)
             for col_name, col_type in meta.columns:
                 self.meta_tree.insert(table_iid, 'end', iid=f'col:{meta.name}.{col_name}', text=f'{col_name} : {col_type}')
+            for idx_name, col_name in meta.indexes:
+                self.meta_tree.insert(table_iid, 'end', iid=f'idx:{meta.name}.{idx_name}', text=f'⚡ 索引: {idx_name} ({col_name})')
         total_tables = len(self.controller.db.list_tables())
         self.status_left_var.set(f'目录: {self.controller.data_dir}  |  共 {total_tables} 张表')
 
@@ -694,6 +782,8 @@ class TxtSqlApp:
             return iid.removeprefix('table:')
         if iid.startswith('col:'):
             return iid.removeprefix('col:').split('.', 1)[0]
+        if iid.startswith('idx:'):
+            return iid.removeprefix('idx:').split('.', 1)[0]
         return None
 
     def _on_meta_double_click(self, _event=None) -> None:
@@ -832,6 +922,11 @@ class TxtSqlApp:
     def _on_ctrl_shift_return(self) -> str:
         self._hide_completion_popup()
         self._run_selected()
+        return 'break'
+
+    def _on_ctrl_e(self) -> str:
+        self._hide_completion_popup()
+        self._explain_current_statement()
         return 'break'
 
     def _on_popup_nav(self, delta: int) -> str | None:
@@ -1101,6 +1196,16 @@ class TxtSqlApp:
             return
         self._execute_text(span.sql)
 
+    def _explain_current_statement(self) -> None:
+        span = self._get_active_statement()
+        if span is None:
+            self._append_message('当前光标所在位置没有可剖析的 SELECT / UNION 语句。', 'info')
+            self.notebook.select(1)
+            return
+        self._hide_completion_popup()
+        report = self.controller.explain_sql(span.sql, analyze=True)
+        self._apply_execution_report(report)
+
     def _run_all(self) -> None:
         script = self.sql_text.get('1.0', 'end-1c')
         self._execute_text(script)
@@ -1116,6 +1221,9 @@ class TxtSqlApp:
     def _execute_text(self, script: str) -> None:
         self._hide_completion_popup()
         report = self.controller.execute_script(script)
+        self._apply_execution_report(report)
+
+    def _apply_execution_report(self, report) -> None:
         if not report.entries:
             self._append_message('未检测到可执行 SQL 语句。', 'info')
             return
@@ -1129,7 +1237,11 @@ class TxtSqlApp:
         if report.last_tabular is not None:
             self._sort_state = None
             self._render_result_table(report.last_tabular, preserve_widths=False)
-            self.notebook.select(0)
+            if report.last_tabular.kind == StatementKind.EXPLAIN and report.last_tabular.plan is not None:
+                self._render_plan_visualization(report.last_tabular)
+                self.notebook.select(4)
+            else:
+                self.notebook.select(0)
         elif report.error_count > 0:
             self.notebook.select(1)
 
@@ -1138,6 +1250,160 @@ class TxtSqlApp:
             self.status_mid_var.set(self._format_entry_summary(last_entry))
         else:
             self.status_mid_var.set(f'执行失败 ({last_entry.elapsed_ms:.2f} ms)')
+
+    def _render_plan_visualization(self, result: QueryResult) -> None:
+        """Render EXPLAIN / EXPLAIN ANALYZE plan canvas, metrics tree, tokens, and AST."""
+        plan = result.plan
+        if plan is None:
+            return
+        opts = collect_plan_optimizations(plan)
+        opt_text = ' | '.join(f'⚡ {o}' for o in opts) if opts else '未触发特定算子优化'
+        root_rows = '-' if plan.rows_out is None else f'{plan.rows_out} 行'
+        self.plan_summary_var.set(f'已启用优化：{opt_text}   |   最终输出：{root_rows}')
+
+        self._draw_plan_canvas(plan)
+        self._populate_plan_tree(plan)
+        self._populate_tokens_and_ast(result.tokens_info, result.ast_tree)
+
+    def _draw_plan_canvas(self, root_plan: PlanNode) -> None:
+        canvas = self.plan_canvas
+        canvas.delete('all')
+
+        card_w, card_h = 236, 92
+        col_step, row_step = 268, 128
+        pad_x, pad_y = 28, 22
+
+        next_slot = [0]
+        coords: dict[int, tuple[float, float]] = {}
+
+        def _layout(node: PlanNode, depth: int) -> float:
+            if not node.children:
+                sx = float(next_slot[0])
+                next_slot[0] += 1
+            else:
+                child_xs = [_layout(ch, depth + 1) for ch in node.children]
+                sx = sum(child_xs) / len(child_xs)
+            cx = pad_x + sx * col_step + card_w / 2
+            cy = pad_y + depth * row_step
+            coords[id(node)] = (cx, cy)
+            return sx
+
+        _layout(root_plan, 0)
+
+        def _sum_time(node: PlanNode) -> float:
+            cur = node.time_ms or 0.0
+            return cur + sum(_sum_time(c) for c in node.children)
+
+        total_time = max(_sum_time(root_plan), 1e-6)
+
+        def _draw_edges(node: PlanNode) -> None:
+            px, py = coords[id(node)]
+            for ch in node.children:
+                cx, cy = coords[id(ch)]
+                x1, y1 = cx, cy
+                x2, y2 = px, py + card_h
+                canvas.create_line(
+                    x1, y1, x2, y2,
+                    arrow=tk.LAST, width=2, fill='#64748b', smooth=True,
+                )
+                if ch.rows_out is not None:
+                    mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                    badge = f'{ch.rows_out} 行'
+                    canvas.create_rectangle(
+                        mx - 28, my - 10, mx + 28, my + 10,
+                        fill='#ffffff', outline='#cbd5e1',
+                    )
+                    canvas.create_text(mx, my, text=badge, font=(self._mono_font, 8, 'bold'), fill='#1e293b')
+                _draw_edges(ch)
+
+        def _draw_nodes(node: PlanNode) -> None:
+            cx, top_y = coords[id(node)]
+            x0, y0 = cx - card_w / 2, top_y
+            x1, y1 = cx + card_w / 2, top_y + card_h
+
+            if 'Index' in node.optimization:
+                fill_c, border_c, hdr_c = '#ecfdf5', '#059669', '#065f46'
+            elif node.optimization:
+                fill_c, border_c, hdr_c = '#eef2ff', '#4f46e5', '#3730a3'
+            else:
+                fill_c, border_c, hdr_c = '#ffffff', '#64748b', '#0f172a'
+
+            canvas.create_rectangle(x0, y0, x1, y1, fill=fill_c, outline=border_c, width=2)
+            title = f'⚡ {node.operator}' if node.optimization else node.operator
+            canvas.create_text(
+                x0 + 10, y0 + 16, anchor='w', text=title,
+                font=(self._mono_font, 10, 'bold'), fill=hdr_c,
+            )
+            detail_txt = node.detail if len(node.detail) <= 28 else node.detail[:25] + '...'
+            canvas.create_text(
+                x0 + 10, y0 + 38, anchor='w', text=detail_txt,
+                font=(self._mono_font, 9), fill='#334155',
+            )
+            if node.rows_in is not None and node.rows_out is not None:
+                metrics = f'{node.rows_in} → {node.rows_out} 行'
+                if node.time_ms is not None:
+                    metrics += f' | {node.time_ms:.2f}ms'
+                canvas.create_text(
+                    x0 + 10, y0 + 60, anchor='w', text=metrics,
+                    font=(self._mono_font, 9), fill='#475569',
+                )
+                ratio = min(1.0, max(0.05, (node.time_ms or 0.0) / total_time))
+                bar_max = card_w - 20
+                canvas.create_rectangle(x0 + 10, y1 - 14, x0 + 10 + bar_max, y1 - 8, fill='#e2e8f0', outline='')
+                canvas.create_rectangle(x0 + 10, y1 - 14, x0 + 10 + bar_max * ratio, y1 - 8, fill=border_c, outline='')
+            elif node.optimization:
+                canvas.create_text(
+                    x0 + 10, y0 + 62, anchor='w', text=node.optimization,
+                    font=(self._mono_font, 9), fill=hdr_c,
+                )
+
+            for ch in node.children:
+                _draw_nodes(ch)
+
+        _draw_edges(root_plan)
+        _draw_nodes(root_plan)
+        bbox = canvas.bbox('all')
+        if bbox:
+            canvas.configure(scrollregion=(0, 0, bbox[2] + pad_x, bbox[3] + pad_y))
+
+    def _populate_plan_tree(self, root_plan: PlanNode) -> None:
+        for item in self.plan_tree.get_children():
+            self.plan_tree.delete(item)
+        analyze = root_plan.rows_out is not None
+        _, rows = flatten_plan_rows(root_plan, analyze=analyze)
+        for row in rows:
+            vals = (
+                row.get('Plan', ''),
+                row.get('Optimization', '-'),
+                row.get('Detail', ''),
+                row.get('RowsIn', '-') if analyze else '-',
+                row.get('RowsOut', '-') if analyze else '-',
+                row.get('Selectivity', '-') if analyze else '-',
+                row.get('Time(ms)', '-') if analyze else '-',
+            )
+            self.plan_tree.insert('', 'end', values=vals)
+
+    def _populate_tokens_and_ast(
+        self,
+        tokens_info: tuple[tuple[str, str, int, int], ...],
+        ast_tree: dict | None,
+    ) -> None:
+        for item in self.token_tree.get_children():
+            self.token_tree.delete(item)
+        for idx, (ttype, tval, line, col) in enumerate(tokens_info, start=1):
+            self.token_tree.insert('', 'end', values=(idx, ttype, tval, f'{line}:{col}'))
+
+        for item in self.ast_tree.get_children():
+            self.ast_tree.delete(item)
+        if ast_tree is not None:
+            def _insert_ast(parent_iid: str, node_dict: dict, depth: int) -> None:
+                iid = self.ast_tree.insert(
+                    parent_iid, 'end', text=node_dict.get('label', ''), open=(depth < 2),
+                )
+                for ch in node_dict.get('children', ()):
+                    _insert_ast(iid, ch, depth + 1)
+
+            _insert_ast('', ast_tree, 0)
 
     def _format_entry_summary(self, entry: ExecutionEntry) -> str:
         res = entry.result
