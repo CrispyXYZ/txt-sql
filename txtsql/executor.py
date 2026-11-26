@@ -10,6 +10,7 @@ from .ast import (
     DropTable, CreateTable, CreateIndex, DropIndex, InsertValues, InsertSelect,
     DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
     ShowTables, ShowIndexes, DescribeTable, ExplainStatement,
+    CheckTable, BeginTransaction, CommitTransaction, RollbackTransaction,
     AggFunc, AggregateExpression, ColumnExpression, Expression, LiteralExpression, StarExpression,
     JoinClause, JoinType, SelectExpression,
     contains_aggregate,
@@ -41,7 +42,8 @@ Statement = (
     CreateTable | DropTable | CreateIndex | DropIndex |
     InsertValues | InsertSelect | DeleteStatement |
     SelectStatement | UnionStatement | UpdateStatement |
-    ImportStatement | ShowTables | ShowIndexes | DescribeTable | ExplainStatement
+    ImportStatement | ShowTables | ShowIndexes | DescribeTable | ExplainStatement |
+    CheckTable | BeginTransaction | CommitTransaction | RollbackTransaction
 )
 
 
@@ -88,6 +90,17 @@ class QueryExecutor:
                 return self.execute_describe(statement)
             case ExplainStatement():
                 return self.execute_explain(statement, tokens=tokens)
+            case CheckTable():
+                return self.execute_check_table(statement)
+            case BeginTransaction():
+                self.storage.begin_transaction()
+                return QueryResult(kind=StatementKind.SYSTEM, message='Transaction started.')
+            case CommitTransaction():
+                self.storage.commit_transaction()
+                return QueryResult(kind=StatementKind.SYSTEM, message='Transaction committed.')
+            case RollbackTransaction():
+                self.storage.rollback_transaction()
+                return QueryResult(kind=StatementKind.SYSTEM, message='Transaction rolled back.')
             case _:
                 raise EngineError(f'Unsupported statement type: {type(statement)}')
 
@@ -548,6 +561,14 @@ class QueryExecutor:
             kind=StatementKind.SYSTEM,
             columns=('Column', 'Type'),
             rows=rows,
+        )
+
+    def execute_check_table(self, statement: CheckTable) -> QueryResult:
+        issues = self.storage.check_table(statement.table_name)
+        return QueryResult(
+            kind=StatementKind.SYSTEM,
+            columns=('Line', 'Status', 'Detail'),
+            rows=issues,
         )
 
     def execute_import(self, statement: ImportStatement) -> QueryResult:

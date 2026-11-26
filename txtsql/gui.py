@@ -771,7 +771,8 @@ class TxtSqlApp:
             for idx_name, col_name in meta.indexes:
                 self.meta_tree.insert(table_iid, 'end', iid=f'idx:{meta.name}.{idx_name}', text=f'⚡ 索引: {idx_name} ({col_name})')
         total_tables = len(self.controller.db.list_tables())
-        self.status_left_var.set(f'目录: {self.controller.data_dir}  |  共 {total_tables} 张表')
+        tx_tag = '  |  [事务中]' if self.controller.db.storage.in_transaction else ''
+        self.status_left_var.set(f'目录: {self.controller.data_dir}  |  共 {total_tables} 张表{tx_tag}')
 
     def _selected_table_name(self) -> str | None:
         sel = self.meta_tree.selection()
@@ -1233,6 +1234,10 @@ class TxtSqlApp:
 
         if report.schema_changed:
             self.refresh_metadata()
+        else:
+            total_tables = len(self.controller.db.list_tables())
+            tx_tag = '  |  [事务中]' if self.controller.db.storage.in_transaction else ''
+            self.status_left_var.set(f'目录: {self.controller.data_dir}  |  共 {total_tables} 张表{tx_tag}')
 
         if report.last_tabular is not None:
             self._sort_state = None
@@ -1691,6 +1696,7 @@ class TxtSqlApp:
             '1.0',
             '【快捷键】\n'
             '  Ctrl+Enter             运行光标所在当前高亮 SQL 语句\n'
+            '  Ctrl+E                 剖析当前语句执行计划 (EXPLAIN ANALYZE)\n'
             '  F5                     运行编辑器全部 SQL 语句\n'
             '  Ctrl+Shift+Enter       仅运行当前选中的 SQL 语句\n'
             '  Ctrl+Space             手动弹出 SQL 代码补全列表\n'
@@ -1700,12 +1706,12 @@ class TxtSqlApp:
             '  Ctrl+L                 清空编辑器内容\n'
             '  Ctrl+Q                 退出客户端\n\n'
             '【支持的 SQL 语法】\n'
-            '  • DDL / DML:\n'
+            '  • DDL / 索引 / DML:\n'
             '      CREATE TABLE [IF NOT EXISTS] tbl (col1 NUMBER, col2 STRING)\n'
             '      DROP TABLE [IF EXISTS] tbl\n'
+            '      CREATE INDEX [IF NOT EXISTS] idx ON tbl (col)  |  DROP INDEX [IF EXISTS] idx\n'
             '      INSERT INTO tbl [(cols)] VALUES (...), (...) | SELECT ...\n'
-            '      UPDATE tbl SET col = expr [WHERE ...]\n'
-            '      DELETE FROM tbl [WHERE ...]\n'
+            '      UPDATE tbl SET col = expr [WHERE ...]  |  DELETE FROM tbl [WHERE ...]\n'
             '  • 单表与聚合查询:\n'
             '      SELECT [DISTINCT] *, tbl.*, expr [AS alias]\n'
             '      WHERE (SQL 三值逻辑: AND / OR / NOT / IS [NOT] NULL / IN / BETWEEN / LIKE)\n'
@@ -1715,8 +1721,10 @@ class TxtSqlApp:
             '      INNER / LEFT / RIGHT / FULL [OUTER] / CROSS / NATURAL / USING JOIN\n'
             '      IN / NOT IN / ANY / ALL / EXISTS / NOT EXISTS / 标量子查询 (含关联)\n'
             '      SELECT ... UNION [ALL] SELECT ...\n'
-            '  • 系统与导入导出:\n'
-            "      SHOW TABLES;  DESCRIBE tbl;  IMPORT tbl FROM 'file.xlsx';  INTO OUTFILE '...'",
+            '  • 剖析、审计、事务与导入导出:\n'
+            '      EXPLAIN [ANALYZE] <SELECT|UNION>  |  CHECK TABLE tbl\n'
+            '      BEGIN [TRANSACTION]  |  COMMIT [TRANSACTION]  |  ROLLBACK [TRANSACTION]\n'
+            "      SHOW TABLES;  SHOW INDEXES [FROM tbl];  DESCRIBE tbl;  IMPORT tbl FROM 'file.xlsx'",
         )
         txt.configure(state='disabled')
         txt.pack(side='left', fill='both', expand=True)

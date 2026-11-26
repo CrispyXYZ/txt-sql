@@ -5,7 +5,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Callable
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .exceptions import (
@@ -102,6 +102,12 @@ class StorageEngine:
         self.indexes_path = self.data_dir / INDEXES_FILENAME
         self._row_cache: dict[str, tuple[tuple[int, int] | None, list[RowDict]]] = {}
         self._index_cache: dict[str, ColumnIndex] = {}
+        self._tx_snapshot: tuple[set[str], dict[str, bytes | None]] | None = None
+
+    @property
+    def in_transaction(self) -> bool:
+        """Whether a snapshot transaction is currently active."""
+        return self._tx_snapshot is not None
 
     # -- Cache & file-change awareness ---------------------------------
 
@@ -355,6 +361,100 @@ class StorageEngine:
         built = ColumnIndex(meta, table.defs[meta.column_name], rows)
         self._index_cache[meta.name] = built
         return built
+
+    # -- Text integrity audit (CHECK TABLE) & snapshot transactions -----
+
+    def check_table(self, name: str) -> list[dict[str, object]]:
+        """Validate TSV formatting, column counts, and NUMBER fields for external edits."""
+        table = self.get_table(name)
+        if table is None:
+            raise TableNotFoundError(f'Table does not exist: {name}')
+        if not table.file_path.exists():
+            return [{'Line': 0, 'Status': 'ERROR', 'Detail': f'Missing data file: {table.file_path.name}'}]
+
+        expected_cols = list(table.defs.items())
+        issues: list[dict[str, object]] = []
+        row_count = 0
+
+        with open(table.file_path, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.reader(f, **_CSV_READ_KWARGS)
+            for row in reader:
+                if not row:
+                    continue
+                row_count += 1
+                line_no = reader.line_num
+                if len(row) != len(expected_cols):
+                    issues.append({
+                        'Line': line_no,
+                        'Status': 'ERROR',
+                        'Detail': f'Column count mismatch: expected {len(expected_cols)}, got {len(row)}',
+                    })
+                    continue
+                for (col_name, col_type), raw_val in zip(expected_cols, row):
+                    if col_type == Types.NUMBER and raw_val not in (_NULL_SENTINEL, ''):
+                        try:
+                            Decimal(raw_val)
+                        except InvalidOperation:
+                            issues.append({
+                                'Line': line_no,
+                                'Status': 'ERROR',
+                                'Detail': f'Invalid NUMBER in column "{col_name}": {raw_val!r}',
+                            })
+
+        if not issues:
+            return [{'Line': 0, 'Status': 'OK', 'Detail': f'Checked {row_count} rows, 0 issues.'}]
+        return issues
+
+    def begin_transaction(self) -> None:
+        """Start a directory-level snapshot transaction."""
+        if self._tx_snapshot is not None:
+            raise EngineError('Transaction already active')
+
+        table_names = {name for name, _, _ in self.list_tables()}
+        files: dict[str, bytes | None] = {}
+        tracked = [METADATA_FILENAME, INDEXES_FILENAME] + [f'{t}.txt' for t in sorted(table_names)]
+        for rel in tracked:
+            p = self.data_dir / rel
+            files[rel] = p.read_bytes() if p.exists() else None
+        self._tx_snapshot = (table_names, files)
+
+    def commit_transaction(self) -> None:
+        """Commit the active snapshot transaction."""
+        if self._tx_snapshot is None:
+            raise EngineError('No active transaction')
+        self._tx_snapshot = None
+
+    def rollback_transaction(self) -> None:
+        """Atomically restore all metadata, indexes, and table TSVs from snapshot."""
+        if self._tx_snapshot is None:
+            raise EngineError('No active transaction')
+
+        snapshot_tables, files = self._tx_snapshot
+        current_tables = {name for name, _, _ in self.list_tables()}
+        for created_tbl in current_tables - snapshot_tables:
+            p = self.data_dir / f'{created_tbl}.txt'
+            if p.exists():
+                p.unlink()
+
+        for rel, content in files.items():
+            target = self.data_dir / rel
+            if content is None:
+                if target.exists():
+                    target.unlink()
+            else:
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                fd, tmp_path = tempfile.mkstemp(dir=self.data_dir, prefix='.txrestore-')
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        f.write(content)
+                    os.replace(tmp_path, target)
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
+
+        self._tx_snapshot = None
+        self.invalidate_all()
 
 
 # ============================================================================

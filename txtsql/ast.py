@@ -346,6 +346,30 @@ class ExplainStatement:
     analyze: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class CheckTable:
+    """CHECK TABLE table_name;"""
+    table_name: str
+
+
+@dataclass(slots=True, frozen=True)
+class BeginTransaction:
+    """BEGIN [TRANSACTION];"""
+    pass
+
+
+@dataclass(slots=True, frozen=True)
+class CommitTransaction:
+    """COMMIT [TRANSACTION];"""
+    pass
+
+
+@dataclass(slots=True, frozen=True)
+class RollbackTransaction:
+    """ROLLBACK [TRANSACTION];"""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Shared AST traversal helpers
 # ---------------------------------------------------------------------------

@@ -712,7 +712,7 @@ class GuiController:
                     StatementKind.UPDATE,
                     StatementKind.DELETE,
                     StatementKind.IMPORT,
-                ):
+                ) or (res.kind == StatementKind.SYSTEM and res.message.startswith('Transaction rolled back')):
                     schema_changed = True
             except TxtSqlError as exc:
                 elapsed_ms = (time.perf_counter() - t0) * 1000

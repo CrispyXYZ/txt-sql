@@ -11,6 +11,7 @@ from .ast import (
     CreateTable, DropTable, InsertValues, InsertSelect,
     DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
     ShowTables, ShowIndexes, DescribeTable, CreateIndex, DropIndex, ExplainStatement,
+    CheckTable, BeginTransaction, CommitTransaction, RollbackTransaction,
     contains_aggregate, collect_non_agg_columns,
 )
 from .exceptions import SqlSyntaxError
@@ -44,7 +45,7 @@ class Parser:
     # Top-level dispatch
     # ------------------------------------------------------------------
 
-    def parse(self) -> CreateTable | DropTable | CreateIndex | DropIndex | InsertValues | InsertSelect | DeleteStatement | SelectStatement | UnionStatement | UpdateStatement | ImportStatement | ShowTables | ShowIndexes | DescribeTable | ExplainStatement:
+    def parse(self) -> CreateTable | DropTable | CreateIndex | DropIndex | InsertValues | InsertSelect | DeleteStatement | SelectStatement | UnionStatement | UpdateStatement | ImportStatement | ShowTables | ShowIndexes | DescribeTable | ExplainStatement | CheckTable | BeginTransaction | CommitTransaction | RollbackTransaction:
         token = self.current_token()
         match token.type:
             case TokenType.CREATE:   stmt = self.create_statement()
@@ -57,6 +58,10 @@ class Parser:
             case TokenType.SHOW:     stmt = self.show_statement()
             case TokenType.DESCRIBE: stmt = self.describe()
             case TokenType.EXPLAIN:  stmt = self.explain_statement()
+            case TokenType.CHECK:    stmt = self.check_table_statement()
+            case TokenType.BEGIN:    stmt = self.begin_transaction()
+            case TokenType.COMMIT:   stmt = self.commit_transaction()
+            case TokenType.ROLLBACK: stmt = self.rollback_transaction()
             case _: raise SqlSyntaxError(f'Unexpected statement: {token.type}')
 
         if self.current_token().type == TokenType.SEMICOLON:
@@ -853,6 +858,30 @@ class Parser:
             raise SqlSyntaxError('EXPLAIN only supports SELECT and UNION statements')
         query = self.select_or_union(allow_outfile=False)
         return ExplainStatement(query=query, analyze=analyze)
+
+    def check_table_statement(self) -> CheckTable:
+        self.eat(TokenType.CHECK)
+        self.eat(TokenType.TABLE)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+        return CheckTable(table_name=table_name)
+
+    def begin_transaction(self) -> BeginTransaction:
+        self.eat(TokenType.BEGIN)
+        if self.current_token().type == TokenType.TRANSACTION:
+            self.eat(TokenType.TRANSACTION)
+        return BeginTransaction()
+
+    def commit_transaction(self) -> CommitTransaction:
+        self.eat(TokenType.COMMIT)
+        if self.current_token().type == TokenType.TRANSACTION:
+            self.eat(TokenType.TRANSACTION)
+        return CommitTransaction()
+
+    def rollback_transaction(self) -> RollbackTransaction:
+        self.eat(TokenType.ROLLBACK)
+        if self.current_token().type == TokenType.TRANSACTION:
+            self.eat(TokenType.TRANSACTION)
+        return RollbackTransaction()
 
 
 # ----------------------------------------------------------------------
