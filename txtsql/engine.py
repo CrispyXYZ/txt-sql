@@ -14,9 +14,13 @@ from .types import RowDict
 class Database:
     """Directory-scoped TxtSQL database session (ready for CLI, GUI, and tests)."""
 
-    def __init__(self, data_dir: str | os.PathLike[str] = '.') -> None:
+    def __init__(
+        self,
+        data_dir: str | os.PathLike[str] = '.',
+        enable_optimizations: bool = True,
+    ) -> None:
         self.storage = StorageEngine(data_dir)
-        self.executor = QueryExecutor(self.storage)
+        self.executor = QueryExecutor(self.storage, enable_optimizations=enable_optimizations)
 
     @property
     def data_dir(self) -> Path:

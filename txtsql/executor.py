@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from .ast import (
-    DropTable, CreateTable, InsertValues, InsertSelect, DeleteStatement, SelectStatement,
-    UnionStatement, UpdateStatement, ImportStatement, ShowTables, DescribeTable,
+    DropTable, CreateTable, CreateIndex, DropIndex, InsertValues, InsertSelect,
+    DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
+    ShowTables, ShowIndexes, DescribeTable,
     AggFunc, AggregateExpression, ColumnExpression, LiteralExpression, StarExpression,
     JoinClause, JoinType, SelectExpression,
     contains_aggregate,
@@ -15,6 +16,7 @@ from .evaluator import (
     resolve_column, to_bool, to_decimal,
 )
 from .exceptions import ColumnNotFoundError, TableAlreadyExistsError, TableNotFoundError, EngineError, TypeMismatchError
+from .index import match_single_table_index
 from .io_handlers import export_rows, read_excel_table
 from .result import QueryResult, StatementKind
 from .storage import StorageEngine, Table
@@ -24,9 +26,10 @@ from .types import Types, RowDict, DataValue
 _TYPE_MAP = {'STRING': Types.STRING, 'NUMBER': Types.NUMBER}
 
 Statement = (
-    CreateTable | DropTable | InsertValues | InsertSelect | DeleteStatement |
+    CreateTable | DropTable | CreateIndex | DropIndex |
+    InsertValues | InsertSelect | DeleteStatement |
     SelectStatement | UnionStatement | UpdateStatement |
-    ImportStatement | ShowTables | DescribeTable
+    ImportStatement | ShowTables | ShowIndexes | DescribeTable
 )
 
 
@@ -42,8 +45,9 @@ class _VisibleColumn:
 class QueryExecutor:
     """Executes parsed SQL AST statements against a directory-scoped StorageEngine."""
 
-    def __init__(self, storage_engine: StorageEngine) -> None:
+    def __init__(self, storage_engine: StorageEngine, enable_optimizations: bool = True) -> None:
         self.storage = storage_engine
+        self.enable_optimizations = enable_optimizations
 
     def execute(self, statement: Statement) -> QueryResult:
         """Dispatch any parsed statement AST and return a structured QueryResult."""
@@ -52,6 +56,10 @@ class QueryExecutor:
                 return self.execute_create(statement)
             case DropTable():
                 return self.execute_drop(statement)
+            case CreateIndex():
+                return self.execute_create_index(statement)
+            case DropIndex():
+                return self.execute_drop_index(statement)
             case InsertValues():
                 return self.execute_insert(statement)
             case InsertSelect():
@@ -68,6 +76,8 @@ class QueryExecutor:
                 return self.execute_import(statement)
             case ShowTables():
                 return self.execute_show_tables(statement)
+            case ShowIndexes():
+                return self.execute_show_indexes(statement)
             case DescribeTable():
                 return self.execute_describe(statement)
             case _:
@@ -93,6 +103,25 @@ class QueryExecutor:
             if not statement.if_exists:
                 raise
         return QueryResult(kind=StatementKind.DDL)
+
+    def execute_create_index(self, statement: CreateIndex) -> QueryResult:
+        meta = self.storage.create_index(
+            statement.index_name,
+            statement.table_name,
+            statement.column_name,
+            if_not_exists=statement.if_not_exists,
+        )
+        return QueryResult(
+            kind=StatementKind.DDL,
+            message=f'Index {meta.name} created on {meta.table_name}({meta.column_name}).',
+        )
+
+    def execute_drop_index(self, statement: DropIndex) -> QueryResult:
+        self.storage.drop_index(statement.index_name, if_exists=statement.if_exists)
+        return QueryResult(
+            kind=StatementKind.DDL,
+            message=f'Index {statement.index_name} dropped.',
+        )
 
     def execute_insert(self, statement: InsertValues) -> QueryResult:
         table = self._get_table(statement.table_name)
@@ -219,6 +248,18 @@ class QueryExecutor:
         return QueryResult(
             kind=StatementKind.SYSTEM,
             columns=('Table', 'Columns', 'Rows'),
+            rows=rows,
+        )
+
+    def execute_show_indexes(self, statement: ShowIndexes) -> QueryResult:
+        metas = self.storage.list_indexes(statement.table_name)
+        rows: list[RowDict] = [
+            {'Index': m.name, 'Table': m.table_name, 'Column': m.column_name}
+            for m in metas
+        ]
+        return QueryResult(
+            kind=StatementKind.SYSTEM,
+            columns=('Index', 'Table', 'Column'),
             rows=rows,
         )
 
@@ -370,13 +411,15 @@ class QueryExecutor:
                 raise EngineError(f'Not unique table/alias: {alias}')
             seen_aliases.add(alias)
 
-        rows_per_table = [table.read_rows() for table in tables]
         use_prefixes = len(sources) > 1 or bool(statement.joins)
         single_qualifier = (sources[0].alias or sources[0].name) if not use_prefixes else None
 
         combined: list[RowDict] = []
         visible_columns: list[_VisibleColumn] | None = None
+        residual_where = statement.where_clause.expression if statement.where_clause is not None else None
+
         if use_prefixes:
+            rows_per_table = [self.storage.get_table_rows(table) for table in tables]
             for combo in _cartesian_product(rows_per_table):
                 row: RowDict = {}
                 for src, r in zip(sources, combo):
@@ -390,7 +433,16 @@ class QueryExecutor:
                     _VisibleColumn(alias, col, f"{alias}.{col}") for col in table.column_names()
                 )
         else:
-            combined = [dict(r) for r in rows_per_table[0]]
+            all_rows = self.storage.get_table_rows(tables[0])
+            idx_match = None
+            if self.enable_optimizations and residual_where is not None:
+                table_indexes = self.storage.get_table_indexes(tables[0])
+                idx_match = match_single_table_index(residual_where, table_indexes, single_qualifier)
+            if idx_match is not None:
+                combined = [dict(all_rows[rid]) for rid in idx_match.row_ids]
+                residual_where = idx_match.residual_expr
+            else:
+                combined = [dict(r) for r in all_rows]
 
         # Apply explicit JOIN clauses left-to-right.
         for jc in statement.joins:
@@ -400,7 +452,7 @@ class QueryExecutor:
                 _VisibleColumn(join_alias, col, f"{join_alias}.{col}")
                 for col in join_table.column_names()
             ]
-            right_rows = [_prefix_row(r, join_alias) for r in join_table.read_rows()]
+            right_rows = [_prefix_row(r, join_alias) for r in self.storage.get_table_rows(join_table)]
             combined, visible_columns = self._apply_join(
                 combined, visible_columns or [], right_rows, right_columns, jc,
                 outer_row=outer_row,
@@ -419,8 +471,8 @@ class QueryExecutor:
         )
 
         # WHERE applies after the full FROM/JOIN has been built.
-        if statement.where_clause is not None:
-            where_func = evaluate_where(statement.where_clause.expression, base_ctx)
+        if residual_where is not None:
+            where_func = evaluate_where(residual_where, base_ctx)
             combined = [r for r in combined if where_func(r)]
 
         table_columns_map: dict[str, list[str]] = {}

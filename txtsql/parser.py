@@ -10,7 +10,7 @@ from .ast import (
     WhereClause, SelectExpression, TableSource,
     CreateTable, DropTable, InsertValues, InsertSelect,
     DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
-    ShowTables, DescribeTable,
+    ShowTables, DescribeTable, CreateIndex, DropIndex, ShowIndexes,
     contains_aggregate, collect_non_agg_columns,
 )
 from .exceptions import SqlSyntaxError
@@ -44,17 +44,17 @@ class Parser:
     # Top-level dispatch
     # ------------------------------------------------------------------
 
-    def parse(self) -> CreateTable | DropTable | InsertValues | InsertSelect | DeleteStatement | SelectStatement | UnionStatement | UpdateStatement | ImportStatement | ShowTables | DescribeTable:
+    def parse(self) -> CreateTable | DropTable | CreateIndex | DropIndex | InsertValues | InsertSelect | DeleteStatement | SelectStatement | UnionStatement | UpdateStatement | ImportStatement | ShowTables | ShowIndexes | DescribeTable:
         token = self.current_token()
         match token.type:
-            case TokenType.CREATE:   stmt = self.create_table()
-            case TokenType.DROP:     stmt = self.drop_table()
+            case TokenType.CREATE:   stmt = self.create_statement()
+            case TokenType.DROP:     stmt = self.drop_statement()
             case TokenType.INSERT:   stmt = self.insert_values()
             case TokenType.DELETE:   stmt = self.delete_statement()
             case TokenType.SELECT:   stmt = self.select_or_union(allow_outfile=True)
             case TokenType.UPDATE:   stmt = self.update_statement()
             case TokenType.IMPORT:   stmt = self.import_statement()
-            case TokenType.SHOW:     stmt = self.show_tables()
+            case TokenType.SHOW:     stmt = self.show_statement()
             case TokenType.DESCRIBE: stmt = self.describe()
             case _: raise SqlSyntaxError(f'Unexpected statement: {token.type}')
 
@@ -357,6 +357,28 @@ class Parser:
     # DDL / DML parsing
     # ------------------------------------------------------------------
 
+    def create_statement(self) -> CreateTable | CreateIndex:
+        if self.peek() == TokenType.INDEX:
+            return self.create_index()
+        return self.create_table()
+
+    def create_index(self) -> CreateIndex:
+        self.eat(TokenType.CREATE)
+        self.eat(TokenType.INDEX)
+        if_not_exists = False
+        if self.current_token().type == TokenType.IF:
+            self.eat(TokenType.IF)
+            self.eat(TokenType.NOT)
+            self.eat(TokenType.EXISTS)
+            if_not_exists = True
+        index_name = self.eat(TokenType.IDENTIFIER).value
+        self.eat(TokenType.ON)
+        table_name = self.eat(TokenType.IDENTIFIER).value
+        self.eat(TokenType.LPAREN)
+        column_name = self.eat(TokenType.IDENTIFIER).value
+        self.eat(TokenType.RPAREN)
+        return CreateIndex(index_name, table_name, column_name, if_not_exists=if_not_exists)
+
     def create_table(self) -> CreateTable:
         self.eat(TokenType.CREATE)
         self.eat(TokenType.TABLE)
@@ -380,6 +402,22 @@ class Parser:
         self.eat(TokenType.RPAREN)
         self._ensure_unique_names([name for name, _ in columns], 'CREATE TABLE')
         return CreateTable(table_name, columns, if_not_exists=if_not_exists)
+
+    def drop_statement(self) -> DropTable | DropIndex:
+        if self.peek() == TokenType.INDEX:
+            return self.drop_index()
+        return self.drop_table()
+
+    def drop_index(self) -> DropIndex:
+        self.eat(TokenType.DROP)
+        self.eat(TokenType.INDEX)
+        if_exists = False
+        if self.current_token().type == TokenType.IF:
+            self.eat(TokenType.IF)
+            self.eat(TokenType.EXISTS)
+            if_exists = True
+        index_name = self.eat(TokenType.IDENTIFIER).value
+        return DropIndex(index_name, if_exists=if_exists)
 
     def drop_table(self) -> DropTable:
         self.eat(TokenType.DROP)
@@ -779,6 +817,20 @@ class Parser:
         self.eat(TokenType.FROM)
         file_path = self.eat(TokenType.STRING).value
         return ImportStatement(table_name, file_path, columns)
+
+    def show_statement(self) -> ShowTables | ShowIndexes:
+        if self.peek() == TokenType.INDEXES:
+            return self.show_indexes()
+        return self.show_tables()
+
+    def show_indexes(self) -> ShowIndexes:
+        self.eat(TokenType.SHOW)
+        self.eat(TokenType.INDEXES)
+        table_name = None
+        if self.current_token().type == TokenType.FROM:
+            self.eat(TokenType.FROM)
+            table_name = self.eat(TokenType.IDENTIFIER).value
+        return ShowIndexes(table_name)
 
     def show_tables(self) -> ShowTables:
         self.eat(TokenType.SHOW)

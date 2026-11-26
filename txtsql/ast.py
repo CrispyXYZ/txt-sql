@@ -317,6 +317,28 @@ class DescribeTable:
     table_name: str
 
 
+@dataclass(slots=True, frozen=True)
+class CreateIndex:
+    """CREATE INDEX [IF NOT EXISTS] index_name ON table_name (column_name);"""
+    index_name: str
+    table_name: str
+    column_name: str
+    if_not_exists: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class DropIndex:
+    """DROP INDEX [IF EXISTS] index_name;"""
+    index_name: str
+    if_exists: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class ShowIndexes:
+    """SHOW INDEXES [FROM table_name];"""
+    table_name: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Shared AST traversal helpers
 # ---------------------------------------------------------------------------

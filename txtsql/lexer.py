@@ -42,6 +42,15 @@ class TokenType(StrEnum):
     SHOW = 'SHOW'
     TABLES = 'TABLES'
     DESCRIBE = 'DESCRIBE'
+    INDEX = 'INDEX'
+    INDEXES = 'INDEXES'
+    EXPLAIN = 'EXPLAIN'
+    ANALYZE = 'ANALYZE'
+    CHECK = 'CHECK'
+    BEGIN = 'BEGIN'
+    COMMIT = 'COMMIT'
+    ROLLBACK = 'ROLLBACK'
+    TRANSACTION = 'TRANSACTION'
     LEFT = 'LEFT'
     RIGHT = 'RIGHT'
     INNER = 'INNER'
@@ -243,6 +252,24 @@ class Lexer:
                 token_type = TokenType.TABLES
             case 'DESCRIBE':
                 token_type = TokenType.DESCRIBE
+            case 'INDEX':
+                token_type = TokenType.INDEX
+            case 'INDEXES':
+                token_type = TokenType.INDEXES
+            case 'EXPLAIN':
+                token_type = TokenType.EXPLAIN
+            case 'ANALYZE':
+                token_type = TokenType.ANALYZE
+            case 'CHECK':
+                token_type = TokenType.CHECK
+            case 'BEGIN':
+                token_type = TokenType.BEGIN
+            case 'COMMIT':
+                token_type = TokenType.COMMIT
+            case 'ROLLBACK':
+                token_type = TokenType.ROLLBACK
+            case 'TRANSACTION':
+                token_type = TokenType.TRANSACTION
             case 'LEFT':
                 token_type = TokenType.LEFT
             case 'RIGHT':

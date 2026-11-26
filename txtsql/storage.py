@@ -8,12 +8,20 @@ from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 
-from .exceptions import EngineError, TableAlreadyExistsError, TableNotFoundError, TypeMismatchError
+from .exceptions import (
+    ColumnNotFoundError,
+    EngineError,
+    TableAlreadyExistsError,
+    TableNotFoundError,
+    TypeMismatchError,
+)
+from .index import ColumnIndex, IndexMeta
 from .types import Types, DataValue, RowDict
 
 _log = logging.getLogger(__name__)
 
 METADATA_FILENAME = 'metadata.txt'
+INDEXES_FILENAME = 'indexes.txt'
 _NULL_SENTINEL = '\\N'
 
 
@@ -91,6 +99,55 @@ class StorageEngine:
     def __init__(self, data_dir: str | os.PathLike[str] = '.') -> None:
         self.data_dir = Path(data_dir)
         self.metadata_path = self.data_dir / METADATA_FILENAME
+        self.indexes_path = self.data_dir / INDEXES_FILENAME
+        self._row_cache: dict[str, tuple[tuple[int, int] | None, list[RowDict]]] = {}
+        self._index_cache: dict[str, ColumnIndex] = {}
+
+    # -- Cache & file-change awareness ---------------------------------
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> tuple[int, int] | None:
+        try:
+            st = path.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            return None
+
+    def invalidate_table(self, table_name: str) -> None:
+        """Invalidate row cache and all secondary indexes cached for a table."""
+        self._row_cache.pop(table_name, None)
+        stale = [
+            idx_name
+            for idx_name, idx_obj in self._index_cache.items()
+            if idx_obj.meta.table_name == table_name
+        ]
+        for idx_name in stale:
+            self._index_cache.pop(idx_name, None)
+
+    def invalidate_all(self) -> None:
+        """Clear all cached rows and secondary indexes."""
+        self._row_cache.clear()
+        self._index_cache.clear()
+
+    def get_table_rows(self, table: Table) -> list[RowDict]:
+        """Return parsed rows for table, automatically refreshing if the TSV file changed."""
+        fp = self._file_fingerprint(table.file_path)
+        cached = self._row_cache.get(table.name)
+        if cached is not None and cached[0] == fp:
+            return cached[1]
+        # File changed or not cached yet: invalidate any stale indexes on this table too.
+        self.invalidate_table(table.name)
+        rows = [table._row_to_dict(raw) for raw in table._read_raw_rows()]
+        self._row_cache[table.name] = (fp, rows)
+        return rows
+
+    def count_cached_rows(self, table: Table) -> int | None:
+        """Return cached row count if fresh, or None if cache miss/stale."""
+        fp = self._file_fingerprint(table.file_path)
+        cached = self._row_cache.get(table.name)
+        if cached is not None and cached[0] == fp:
+            return len(cached[1])
+        return None
 
     def create_table(self, name: str, defs: dict[str, Types]) -> Table:
         """Create a table in this engine's data directory and return it."""
@@ -113,8 +170,9 @@ class StorageEngine:
             _log.debug(f'Writing metadata: {row}')
             metadata.write('\t'.join(row) + '\n')
 
-        table = Table(name, defs, data_dir=self.data_dir)
+        table = Table(name, defs, data_dir=self.data_dir, storage=self)
         table.create_if_not_exists()
+        self.invalidate_table(name)
         return table
 
     def get_table(self, name: str) -> Table | None:
@@ -128,7 +186,7 @@ class StorageEngine:
                     return None
                 count = int(row[1])
                 defs = {row[i]: Types(row[i + 1]) for i in range(2, 2 + count * 2, 2)}
-                return Table(name, defs, data_dir=self.data_dir)
+                return Table(name, defs, data_dir=self.data_dir, storage=self)
         except FileNotFoundError:
             _log.warning('%s not found. Returning None.', self.metadata_path)
             return None
@@ -191,6 +249,113 @@ class StorageEngine:
                     os.remove(tmp_path)
                 raise
 
+        self._drop_indexes_for_table(name)
+        self.invalidate_table(name)
+
+    # -- Secondary index metadata & cache ------------------------------
+
+    def _read_index_rows(self) -> list[IndexMeta]:
+        try:
+            with open(self.indexes_path, 'r', encoding='utf-8', newline='') as f:
+                reader = csv.reader(f, delimiter='\t')
+                return [
+                    IndexMeta(name=row[0], table_name=row[1], column_name=row[2])
+                    for row in reader
+                    if len(row) >= 3
+                ]
+        except FileNotFoundError:
+            return []
+
+    def _write_index_rows(self, metas: list[IndexMeta]) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=self.data_dir, prefix='.indexes-')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f, delimiter='\t', lineterminator='\n')
+                writer.writerows([[m.name, m.table_name, m.column_name] for m in metas])
+            os.replace(tmp_path, self.indexes_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    def _drop_indexes_for_table(self, table_name: str) -> None:
+        metas = self._read_index_rows()
+        if not metas:
+            return
+        kept = [m for m in metas if m.table_name != table_name]
+        if len(kept) != len(metas):
+            self._write_index_rows(kept)
+
+    def create_index(
+        self,
+        index_name: str,
+        table_name: str,
+        column_name: str,
+        if_not_exists: bool = False,
+    ) -> IndexMeta:
+        """Create and build a secondary index on table_name(column_name)."""
+        table = self.get_table(table_name)
+        if table is None:
+            raise TableNotFoundError(f'Table does not exist: {table_name}')
+        if column_name not in table.defs:
+            raise ColumnNotFoundError(f'Column does not exist: {column_name}')
+
+        metas = self._read_index_rows()
+        existing = next((m for m in metas if m.name == index_name), None)
+        if existing is not None:
+            if if_not_exists:
+                return existing
+            raise EngineError(f'Index already exists: {index_name}')
+
+        meta = IndexMeta(name=index_name, table_name=table_name, column_name=column_name)
+        metas.append(meta)
+        self._write_index_rows(metas)
+        self.get_built_index(table, meta)
+        return meta
+
+    def drop_index(self, index_name: str, if_exists: bool = False) -> None:
+        """Drop a secondary index from indexes.txt and cache."""
+        metas = self._read_index_rows()
+        kept = [m for m in metas if m.name != index_name]
+        if len(kept) == len(metas):
+            if if_exists:
+                return
+            raise EngineError(f'Index does not exist: {index_name}')
+        self._write_index_rows(kept)
+        self._index_cache.pop(index_name, None)
+
+    def list_indexes(self, table_name: str | None = None) -> list[IndexMeta]:
+        """List all persisted indexes (optionally filtered by table_name)."""
+        metas = self._read_index_rows()
+        if table_name is not None:
+            return [m for m in metas if m.table_name == table_name]
+        return metas
+
+    def get_table_indexes(self, table: Table) -> dict[str, tuple[IndexMeta, ColumnIndex]]:
+        """Return {column_name: (IndexMeta, ColumnIndex)} for all indexes on table."""
+        metas = self.list_indexes(table.name)
+        if not metas:
+            return {}
+        result: dict[str, tuple[IndexMeta, ColumnIndex]] = {}
+        for meta in metas:
+            if meta.column_name not in table.defs:
+                continue
+            col_idx = self.get_built_index(table, meta)
+            # First index created on a column takes precedence.
+            result.setdefault(meta.column_name, (meta, col_idx))
+        return result
+
+    def get_built_index(self, table: Table, meta: IndexMeta) -> ColumnIndex:
+        """Return a fresh ColumnIndex, rebuilding automatically if the table TSV changed."""
+        rows = self.get_table_rows(table)
+        cached = self._index_cache.get(meta.name)
+        if cached is not None:
+            return cached
+        built = ColumnIndex(meta, table.defs[meta.column_name], rows)
+        self._index_cache[meta.name] = built
+        return built
+
 
 # ============================================================================
 # Table class
@@ -205,12 +370,19 @@ class Table:
     filename: str
     defs: dict[str, Types]
 
-    def __init__(self, name: str, defs: dict[str, Types], data_dir: str | os.PathLike[str] = '.') -> None:
+    def __init__(
+        self,
+        name: str,
+        defs: dict[str, Types],
+        data_dir: str | os.PathLike[str] = '.',
+        storage: StorageEngine | None = None,
+    ) -> None:
         self.name = name
         self.data_dir = Path(data_dir)
         self.file_path = self.data_dir / f'{self.name}.txt'
         self.filename = str(self.file_path)
         self.defs = defs
+        self._storage = storage
 
     # -- Public helpers ------------------------------------------------
 
@@ -224,6 +396,10 @@ class Table:
 
     def count_rows(self) -> int:
         """Count records in the table (safe with multi-line strings)."""
+        if self._storage is not None:
+            cached_count = self._storage.count_cached_rows(self)
+            if cached_count is not None:
+                return cached_count
         try:
             with open(self.file_path, 'r', encoding='utf-8', newline='') as f:
                 reader = csv.reader(f, **_CSV_READ_KWARGS)
@@ -251,6 +427,8 @@ class Table:
         with open(self.file_path, 'a', encoding='utf-8', newline='') as file:
             writer = csv.writer(file, **_CSV_WRITE_KWARGS)
             writer.writerows(prepared)
+        if self._storage is not None:
+            self._storage.invalidate_table(self.name)
 
     def insert_values(self, values: RowDict) -> None:
         """Insert a single row. Use None for SQL NULL."""
@@ -344,6 +522,8 @@ class Table:
 
     def read_rows(self) -> list[RowDict]:
         """Read all rows from the table as typed RowDicts."""
+        if self._storage is not None:
+            return [dict(r) for r in self._storage.get_table_rows(self)]
         return [self._row_to_dict(row) for row in self._read_raw_rows()]
 
     def select(self) -> list[RowDict]:
@@ -370,6 +550,8 @@ class Table:
                 writer = csv.writer(file, **_CSV_WRITE_KWARGS)
                 writer.writerows(rows)
             os.replace(tmp_path, self.file_path)
+            if self._storage is not None:
+                self._storage.invalidate_table(self.name)
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
