@@ -261,3 +261,39 @@ class ShowTables:
 class DescribeTable:
     """DESCRIBE table_name;"""
     table_name: str
+
+
+# ---------------------------------------------------------------------------
+# Shared AST traversal helpers
+# ---------------------------------------------------------------------------
+
+def contains_aggregate(expr: Expression) -> bool:
+    """Return True if expr contains an AggregateExpression outside nested subqueries."""
+    match expr:
+        case AggregateExpression():
+            return True
+        case BinaryExpression(left, _, right) | ConditionExpression(left, _, right) | LogicalExpression(left, _, right):
+            return contains_aggregate(left) or contains_aggregate(right)
+        case NullCheckExpression(inner, _):
+            return contains_aggregate(inner)
+        case InExpression(inner, _, _) | AnyAllExpression(inner, _, _, _):
+            return contains_aggregate(inner)
+        case _:
+            return False
+
+
+def collect_non_agg_columns(expr: Expression) -> list[ColumnExpression]:
+    """Collect ColumnExpression nodes outside aggregate calls and nested subqueries."""
+    match expr:
+        case AggregateExpression():
+            return []
+        case ColumnExpression():
+            return [expr]
+        case BinaryExpression(left, _, right) | ConditionExpression(left, _, right) | LogicalExpression(left, _, right):
+            return collect_non_agg_columns(left) + collect_non_agg_columns(right)
+        case NullCheckExpression(inner, _):
+            return collect_non_agg_columns(inner)
+        case InExpression(inner, _, _) | AnyAllExpression(inner, _, _, _):
+            return collect_non_agg_columns(inner)
+        case _:
+            return []

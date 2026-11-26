@@ -6,8 +6,9 @@ import traceback
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .engine import execute_sql
+from .engine import Database
 from .exceptions import TxtSqlError
+from .result import StatementKind
 
 
 def _format_cell(value: Any) -> str:
@@ -44,10 +45,12 @@ def print_table(rows: Sequence[Mapping[str, Any]]) -> None:
     print(separator)
 
 
-def run_cli() -> None:
+def run_cli(data_dir: str | os.PathLike[str] = '.') -> None:
     """Start the interactive TxtSQL REPL."""
     log_level = os.environ.get('TXT_SQL_LOG_LEVEL', 'WARNING')
     logging.basicConfig(level=getattr(logging, log_level.upper(), logging.WARNING))
+
+    db = Database(data_dir)
 
     print("Welcome to TxtSql CLI. Type your SQL statement and press Enter.")
     print("Type 'exit' or 'quit' to exit.")
@@ -99,19 +102,23 @@ def run_cli() -> None:
         # Check if the statement ends with a semicolon -> complete
         if statement.endswith(";"):
             try:
-                result = execute_sql(statement.rstrip(";").strip())
+                result = db.execute(statement.rstrip(";").strip())
             except TxtSqlError as e:
                 print(f"Error: {e}")
             except Exception as e:
                 print(f"Unexpected error: {e}")
                 traceback.print_exc()
             else:
-                if isinstance(result, list):
-                    print_table(result)
-                elif isinstance(result, int):
-                    print(f"{result} rows affected.")
-                elif result is not None:
-                    print(result)
+                if result.is_tabular:
+                    print_table(result.rows)
+                elif result.kind in (
+                    StatementKind.INSERT,
+                    StatementKind.UPDATE,
+                    StatementKind.DELETE,
+                    StatementKind.IMPORT,
+                    StatementKind.EXPORT,
+                ):
+                    print(f"{result.affected_rows} rows affected.")
                 else:
                     print("Query OK.")
             finally:

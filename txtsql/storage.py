@@ -6,6 +6,7 @@ import os
 import tempfile
 from collections.abc import Callable
 from decimal import Decimal
+from pathlib import Path
 
 from .exceptions import EngineError, TableAlreadyExistsError, TableNotFoundError, TypeMismatchError
 from .types import Types, DataValue, RowDict
@@ -25,110 +26,6 @@ _UNCHANGED = _Unchanged()
 
 
 # ============================================================================
-# Module-level functions
-# ============================================================================
-
-def create_table(name: str, defs: dict[str, Types]) -> Table:
-    """Create a table and return it."""
-    _log.debug(f'Creating table: {name}')
-    if not defs:
-        raise EngineError('Table must have at least one column')
-
-    try:
-        with open(METADATA_FILENAME, 'r', encoding='utf-8') as metadata:
-            reader = csv.reader(metadata, delimiter='\t')
-            if any(row and row[0] == name for row in reader):
-                raise TableAlreadyExistsError(f'Table already exists: {name}')
-    except FileNotFoundError:
-        pass
-
-    with open(METADATA_FILENAME, 'a', encoding='utf-8') as metadata:
-        row = [name, str(len(defs))] + [str(x) for pair in defs.items() for x in pair]
-        _log.debug(f'Writing metadata: {row}')
-        metadata.write('\t'.join(row) + '\n')
-
-    table = Table(name, defs)
-    table.create_if_not_exists()
-    return table
-
-
-def get_table(name: str) -> Table | None:
-    """Return Table object or None if table doesn't exist."""
-    _log.debug(f'Getting table: {name}')
-    try:
-        with open(METADATA_FILENAME, 'r', encoding='utf-8') as metadata:
-            reader = csv.reader(metadata, delimiter='\t')
-            row = next((row for row in reader if row and row[0] == name), None)
-            if row is None:
-                return None
-            count = int(row[1])
-            return Table(name, {row[i]: Types(row[i + 1]) for i in range(2, 2 + count * 2, 2)})
-    except FileNotFoundError:
-        _log.warning('metadata.txt file not found. Returning None.')
-        return None
-
-
-def list_tables() -> list[tuple[str, int, dict[str, str]]]:
-    """Return all tables with their definitions.
-    Returns: list of (table_name, col_count, {col_name: col_type_str})
-    """
-    result: list[tuple[str, int, dict[str, str]]] = []
-    try:
-        with open(METADATA_FILENAME, 'r', encoding='utf-8') as metadata:
-            reader = csv.reader(metadata, delimiter='\t')
-            for row in reader:
-                if not row:
-                    continue
-                name = row[0]
-                count = int(row[1])
-                defs = {row[i]: row[i + 1] for i in range(2, len(row), 2)}
-                result.append((name, count, defs))
-    except FileNotFoundError:
-        pass
-    return result
-
-
-def drop_table(name: str) -> None:
-    """Drop table and erase metadata atomically."""
-    _log.debug(f'Dropping table: {name}')
-    data_filename = f'{name}.txt'
-
-    existing_rows: list[list[str]] = []
-    in_metadata = False
-    try:
-        with open(METADATA_FILENAME, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter='\t')
-            for row in reader:
-                if not row:
-                    continue
-                if row[0] == name:
-                    in_metadata = True
-                else:
-                    existing_rows.append(row)
-    except FileNotFoundError:
-        pass
-
-    file_exists = os.path.exists(data_filename)
-    if not in_metadata and not file_exists:
-        raise TableNotFoundError(f'Table does not exist: {name}')
-
-    if file_exists:
-        os.remove(data_filename)
-
-    if os.path.exists(METADATA_FILENAME) or in_metadata:
-        fd, tmp_path = tempfile.mkstemp(dir='.', prefix='.metadata-')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.writer(f, delimiter='\t', lineterminator='\n')
-                writer.writerows(existing_rows)
-            os.replace(tmp_path, METADATA_FILENAME)
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise
-
-
-# ============================================================================
 # Serialization helpers
 # ============================================================================
 
@@ -145,14 +42,6 @@ def _coerce_number(value: object) -> Decimal:
     raise TypeMismatchError(f'Expected NUMBER value, got {type(value).__name__}')
 
 
-def _string_to_number(string: str) -> Decimal:
-    return Decimal(string)
-
-
-def _number_to_string(number: Decimal) -> str:
-    return str(number)
-
-
 def _data_to_string(value: object, type_def: Types) -> str:
     """Convert data value to string for TSV storage.
 
@@ -163,7 +52,7 @@ def _data_to_string(value: object, type_def: Types) -> str:
         return _NULL_SENTINEL
     match type_def:
         case Types.NUMBER:
-            return _number_to_string(_coerce_number(value))
+            return str(_coerce_number(value))
         case Types.STRING:
             if not isinstance(value, str):
                 raise TypeMismatchError(f'Expected STRING value, got {type(value).__name__}')
@@ -176,7 +65,7 @@ def _string_to_data(string: str, type_def: Types) -> DataValue:
         return None
     match type_def:
         case Types.NUMBER:
-            return _string_to_number(string)
+            return Decimal(string)
         case Types.STRING:
             return string.replace('\\\\', '\\')
 
@@ -190,19 +79,134 @@ _CSV_READ_KWARGS = dict(delimiter='\t')
 
 
 # ============================================================================
+# StorageEngine (directory-scoped)
+# ============================================================================
+
+class StorageEngine:
+    """Directory-scoped TSV storage manager for metadata.txt and <table>.txt files."""
+
+    def __init__(self, data_dir: str | os.PathLike[str] = '.') -> None:
+        self.data_dir = Path(data_dir)
+        self.metadata_path = self.data_dir / METADATA_FILENAME
+
+    def create_table(self, name: str, defs: dict[str, Types]) -> Table:
+        """Create a table in this engine's data directory and return it."""
+        _log.debug(f'Creating table: {name} in {self.data_dir}')
+        if not defs:
+            raise EngineError('Table must have at least one column')
+
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with open(self.metadata_path, 'r', encoding='utf-8') as metadata:
+                reader = csv.reader(metadata, delimiter='\t')
+                if any(row and row[0] == name for row in reader):
+                    raise TableAlreadyExistsError(f'Table already exists: {name}')
+        except FileNotFoundError:
+            pass
+
+        with open(self.metadata_path, 'a', encoding='utf-8') as metadata:
+            row = [name, str(len(defs))] + [str(x) for pair in defs.items() for x in pair]
+            _log.debug(f'Writing metadata: {row}')
+            metadata.write('\t'.join(row) + '\n')
+
+        table = Table(name, defs, data_dir=self.data_dir)
+        table.create_if_not_exists()
+        return table
+
+    def get_table(self, name: str) -> Table | None:
+        """Return Table object or None if table doesn't exist."""
+        _log.debug(f'Getting table: {name} from {self.data_dir}')
+        try:
+            with open(self.metadata_path, 'r', encoding='utf-8') as metadata:
+                reader = csv.reader(metadata, delimiter='\t')
+                row = next((row for row in reader if row and row[0] == name), None)
+                if row is None:
+                    return None
+                count = int(row[1])
+                defs = {row[i]: Types(row[i + 1]) for i in range(2, 2 + count * 2, 2)}
+                return Table(name, defs, data_dir=self.data_dir)
+        except FileNotFoundError:
+            _log.warning('%s not found. Returning None.', self.metadata_path)
+            return None
+
+    def list_tables(self) -> list[tuple[str, int, dict[str, str]]]:
+        """Return all tables with their column counts and definitions.
+        Returns: list of (table_name, col_count, {col_name: col_type_str})
+        """
+        result: list[tuple[str, int, dict[str, str]]] = []
+        try:
+            with open(self.metadata_path, 'r', encoding='utf-8') as metadata:
+                reader = csv.reader(metadata, delimiter='\t')
+                for row in reader:
+                    if not row:
+                        continue
+                    name = row[0]
+                    count = int(row[1])
+                    defs = {row[i]: row[i + 1] for i in range(2, len(row), 2)}
+                    result.append((name, count, defs))
+        except FileNotFoundError:
+            pass
+        return result
+
+    def drop_table(self, name: str) -> None:
+        """Drop table and erase metadata atomically."""
+        _log.debug(f'Dropping table: {name} from {self.data_dir}')
+        data_path = self.data_dir / f'{name}.txt'
+
+        existing_rows: list[list[str]] = []
+        in_metadata = False
+        try:
+            with open(self.metadata_path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f, delimiter='\t')
+                for row in reader:
+                    if not row:
+                        continue
+                    if row[0] == name:
+                        in_metadata = True
+                    else:
+                        existing_rows.append(row)
+        except FileNotFoundError:
+            pass
+
+        file_exists = data_path.exists()
+        if not in_metadata and not file_exists:
+            raise TableNotFoundError(f'Table does not exist: {name}')
+
+        if file_exists:
+            data_path.unlink()
+
+        if self.metadata_path.exists() or in_metadata:
+            fd, tmp_path = tempfile.mkstemp(dir=self.data_dir, prefix='.metadata-')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.writer(f, delimiter='\t', lineterminator='\n')
+                    writer.writerows(existing_rows)
+                os.replace(tmp_path, self.metadata_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+
+
+# ============================================================================
 # Table class
 # ============================================================================
 
 class Table:
-    """A table stored as a TSV file."""
+    """A table stored as a TSV file in a target data directory."""
 
     name: str
+    data_dir: Path
+    file_path: Path
     filename: str
     defs: dict[str, Types]
 
-    def __init__(self, name: str, defs: dict[str, Types]) -> None:
+    def __init__(self, name: str, defs: dict[str, Types], data_dir: str | os.PathLike[str] = '.') -> None:
         self.name = name
-        self.filename = f'{self.name}.txt'
+        self.data_dir = Path(data_dir)
+        self.file_path = self.data_dir / f'{self.name}.txt'
+        self.filename = str(self.file_path)
         self.defs = defs
 
     # -- Public helpers ------------------------------------------------
@@ -218,7 +222,7 @@ class Table:
     def count_rows(self) -> int:
         """Count records in the table (safe with multi-line strings)."""
         try:
-            with open(self.filename, 'r', encoding='utf-8', newline='') as f:
+            with open(self.file_path, 'r', encoding='utf-8', newline='') as f:
                 reader = csv.reader(f, **_CSV_READ_KWARGS)
                 return sum(1 for row in reader if row)
         except FileNotFoundError:
@@ -227,9 +231,10 @@ class Table:
     # -- File management -----------------------------------------------
 
     def create_if_not_exists(self) -> None:
-        if not os.path.exists(self.filename):
-            _log.debug(f'Creating file: {self.filename}')
-            with open(self.filename, 'w', encoding='utf-8'):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        if not self.file_path.exists():
+            _log.debug(f'Creating file: {self.file_path}')
+            with open(self.file_path, 'w', encoding='utf-8'):
                 pass
 
     # -- CRUD ----------------------------------------------------------
@@ -240,7 +245,7 @@ class Table:
             [_data_to_string(values.get(key), value) for key, value in self.defs.items()]
             for values in rows
         ]
-        with open(self.filename, 'a', encoding='utf-8', newline='') as file:
+        with open(self.file_path, 'a', encoding='utf-8', newline='') as file:
             writer = csv.writer(file, **_CSV_WRITE_KWARGS)
             writer.writerows(prepared)
 
@@ -311,51 +316,20 @@ class Table:
         self._write_raw_rows(kept)
         return deleted_count
 
-    def select(
-            self,
-            columns: list[str] | None = None,
-            where: Callable[[RowDict], bool] | None = None,
-            order_by: list[tuple[str, bool]] | None = None,
-            distinct: bool = False,
-            limit: int | None = None,
-            offset: int = 0,
-    ) -> list[RowDict]:
-        """
-        Read rows from the table with optional filtering, projection, sorting, and pagination.
-        Aggregate logic (GROUP BY, aggregations, HAVING) is handled in executor.py.
-        """
-        rows = self._read_rows()
+    def read_rows(self) -> list[RowDict]:
+        """Read all rows from the table as typed RowDicts."""
+        return [self._row_to_dict(row) for row in self._read_raw_rows()]
 
-        # WHERE
-        if where is not None:
-            rows = [r for r in rows if where(r)]
-
-        # Column projection
-        if columns is not None:
-            rows = self._project(rows, columns)
-
-        # DISTINCT
-        if distinct:
-            rows = self._dedup(rows)
-
-        # ORDER BY
-        if order_by:
-            rows = self._order(rows, order_by)
-
-        # OFFSET / LIMIT
-        if offset > 0:
-            rows = rows[offset:]
-        if limit is not None:
-            rows = rows[:limit]
-
-        return rows
+    def select(self) -> list[RowDict]:
+        """Backward-compatible alias for read_rows()."""
+        return self.read_rows()
 
     # -- Internal helpers ----------------------------------------------
 
     def _read_raw_rows(self) -> list[list[str]]:
         """Read all rows from the TSV file as raw string lists."""
         try:
-            with open(self.filename, 'r', encoding='utf-8', newline='') as file:
+            with open(self.file_path, 'r', encoding='utf-8', newline='') as file:
                 reader = csv.reader(file, **_CSV_READ_KWARGS)
                 return [row for row in reader if row]
         except FileNotFoundError:
@@ -363,52 +337,38 @@ class Table:
 
     def _write_raw_rows(self, rows: list[list[str]]) -> None:
         """Atomically write raw rows to the TSV file using a temp file + rename."""
-        fd, tmp_path = tempfile.mkstemp(dir='.', prefix=f'.{self.name}-')
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=self.data_dir, prefix=f'.{self.name}-')
         try:
             with os.fdopen(fd, 'w', encoding='utf-8', newline='') as file:
                 writer = csv.writer(file, **_CSV_WRITE_KWARGS)
                 writer.writerows(rows)
-            os.replace(tmp_path, self.filename)
+            os.replace(tmp_path, self.file_path)
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise
 
-    def _read_rows(self) -> list[RowDict]:
-        """Read raw rows and convert to list[RowDict]."""
-        return [self._row_to_dict(row) for row in self._read_raw_rows()]
-
     def _row_to_dict(self, row: list[str]) -> RowDict:
         """Convert a single raw row (list of strings) to a typed RowDict."""
         return {key: _string_to_data(val, typ) for val, (key, typ) in zip(row, self.defs.items())}
 
-    @staticmethod
-    def _project(rows: list[RowDict], columns: list[str]) -> list[RowDict]:
-        """Project rows down to the given columns."""
-        return [{col: r[col] for col in columns if col in r} for r in rows]
 
-    @staticmethod
-    def _dedup(rows: list[RowDict]) -> list[RowDict]:
-        """Remove duplicate rows in a type-safe manner."""
-        seen = set()
-        result: list[RowDict] = []
-        for r in rows:
-            key = tuple(
-                (k, (0, None) if v is None else (1, v) if isinstance(v, Decimal) else (2, v))
-                for k, v in r.items()
-            )
-            if key not in seen:
-                seen.add(key)
-                result.append(r)
-        return result
+# ============================================================================
+# Backward-compatible module-level functions (operating on current working dir)
+# ============================================================================
 
-    @staticmethod
-    def _order(rows: list[RowDict], order_by: list[tuple[str, bool]]) -> list[RowDict]:
-        """Sort rows by given columns. NULLs sort last regardless of direction."""
-        result = list(rows)
-        for col, desc in reversed(order_by):
-            null_rows = [r for r in result if r.get(col) is None]
-            non_null_rows = [r for r in result if r.get(col) is not None]
-            non_null_rows.sort(key=lambda r, _c=col: r[_c], reverse=desc)
-            result = non_null_rows + null_rows
-        return result
+def create_table(name: str, defs: dict[str, Types]) -> Table:
+    return StorageEngine().create_table(name, defs)
+
+
+def get_table(name: str) -> Table | None:
+    return StorageEngine().get_table(name)
+
+
+def list_tables() -> list[tuple[str, int, dict[str, str]]]:
+    return StorageEngine().list_tables()
+
+
+def drop_table(name: str) -> None:
+    StorageEngine().drop_table(name)

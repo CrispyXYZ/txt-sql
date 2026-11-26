@@ -14,10 +14,12 @@ SQL string → Lexer → Tokens → Parser → AST → Executor → Storage (TSV
 |---|---|
 | `lexer.py` | Tokenises SQL text into `Token` stream |
 | `parser.py` | Recursive-descent parser producing AST nodes (`ast.py`) |
-| `evaluator.py` | Compiles WHERE/HAVING expressions into row predicates |
-| `executor.py` | Executes statements — coordinates storage and evaluator |
-| `storage.py` | TSV-file CRUD: `Table` class with atomic writes |
-| `engine.py` | Orchestrator: `execute_sql(sql)` runs the full pipeline |
+| `evaluator.py` | Evaluates expressions & compiles predicates with `EvalContext` |
+| `executor.py` | `QueryExecutor` runs statements against `StorageEngine` |
+| `io_handlers.py` | External `.xlsx` / `.csv` / `.tsv` import and export |
+| `storage.py` | Directory-scoped `StorageEngine` & `Table` with atomic TSV writes |
+| `result.py` | Structured `QueryResult` and `StatementKind` |
+| `engine.py` | `Database(data_dir)` session orchestrator & `execute_sql()` |
 | `cli.py` | Interactive REPL with ASCII table output |
 
 ## Requirements
@@ -33,6 +35,16 @@ pip install openpyxl
 
 ```bash
 python -m txtsql
+```
+
+Python API (directory-scoped session & structured results):
+
+```python
+from txtsql import Database
+
+db = Database("./my_data")
+res = db.execute("SELECT id, name FROM employees ORDER BY id ASC;")
+print(res.columns, res.rows)
 ```
 
 ```

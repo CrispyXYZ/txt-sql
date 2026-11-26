@@ -9,6 +9,7 @@ from .ast import (
     CreateTable, DropTable, InsertValues,
     DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
     ShowTables, DescribeTable,
+    contains_aggregate, collect_non_agg_columns,
 )
 from .exceptions import SqlSyntaxError
 from .lexer import Token, TokenType
@@ -521,7 +522,7 @@ class Parser:
         if self.current_token().type == TokenType.WHERE:
             self.eat(TokenType.WHERE)
             where_expr = self.parse_expression()
-            if _contains_aggregate(where_expr):
+            if contains_aggregate(where_expr):
                 raise SqlSyntaxError('Aggregate functions are not allowed in WHERE clause')
             where_clause = WhereClause(where_expr)
 
@@ -545,12 +546,12 @@ class Parser:
         if select_exprs is None and group_by is not None:
             raise SqlSyntaxError('SELECT * cannot be used with GROUP BY')
 
-        has_agg_in_select = any(_contains_aggregate(se.expr) for se in (select_exprs or []))
+        has_agg_in_select = any(contains_aggregate(se.expr) for se in (select_exprs or []))
         if select_exprs is not None:
             non_agg_cols = [
                 col
                 for se in select_exprs
-                for col in _collect_non_agg_columns(se.expr)
+                for col in collect_non_agg_columns(se.expr)
             ]
             if has_agg_in_select and group_by is None:
                 if non_agg_cols:
@@ -650,7 +651,7 @@ class Parser:
         if self.current_token().type == TokenType.WHERE:
             self.eat(TokenType.WHERE)
             where_expr = self.parse_expression()
-            if _contains_aggregate(where_expr):
+            if contains_aggregate(where_expr):
                 raise SqlSyntaxError('Aggregate functions are not allowed in WHERE clause')
             where_clause = WhereClause(where_expr)
         return DeleteStatement(table_name, where_clause)
@@ -672,7 +673,7 @@ class Parser:
         if self.current_token().type == TokenType.WHERE:
             self.eat(TokenType.WHERE)
             where_expr = self.parse_expression()
-            if _contains_aggregate(where_expr):
+            if contains_aggregate(where_expr):
                 raise SqlSyntaxError('Aggregate functions are not allowed in WHERE clause')
             where_clause = WhereClause(where_expr)
         return UpdateStatement(table_name, set_clauses, where_clause)
@@ -714,36 +715,6 @@ class Parser:
 # ----------------------------------------------------------------------
 
 _AGG_FUNC_TOKEN_MAP = Parser._AGG_FUNC_TOKEN_MAP
-
-
-def _contains_aggregate(expr: Expression) -> bool:
-    match expr:
-        case AggregateExpression():
-            return True
-        case BinaryExpression(left, _, right) | ConditionExpression(left, _, right) | LogicalExpression(left, _, right):
-            return _contains_aggregate(left) or _contains_aggregate(right)
-        case NullCheckExpression(inner, _):
-            return _contains_aggregate(inner)
-        case InExpression(inner, _, _) | AnyAllExpression(inner, _, _, _):
-            return _contains_aggregate(inner)
-        case _:
-            return False
-
-
-def _collect_non_agg_columns(expr: Expression) -> list[ColumnExpression]:
-    match expr:
-        case AggregateExpression():
-            return []
-        case ColumnExpression():
-            return [expr]
-        case BinaryExpression(left, _, right) | ConditionExpression(left, _, right) | LogicalExpression(left, _, right):
-            return _collect_non_agg_columns(left) + _collect_non_agg_columns(right)
-        case NullCheckExpression(inner, _):
-            return _collect_non_agg_columns(inner)
-        case InExpression(inner, _, _) | AnyAllExpression(inner, _, _, _):
-            return _collect_non_agg_columns(inner)
-        case _:
-            return []
 
 
 def _col_matches_group_by(col: ColumnExpression, gb: ColumnExpression) -> bool:

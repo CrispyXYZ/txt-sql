@@ -1,33 +1,42 @@
-from .ast import (
-    CreateTable, DeleteStatement, DescribeTable, DropTable, InsertValues,
-    ImportStatement, SelectStatement, UnionStatement, ShowTables, UpdateStatement,
-)
-from .exceptions import EngineError
-from .executor import (
-    execute_drop, execute_create, execute_insert, execute_delete,
-    execute_describe, execute_import, execute_select, execute_union,
-    execute_show_tables, execute_update,
-)
+"""Top-level orchestration: Database session object and execute_sql helper."""
+
+import os
+from pathlib import Path
+
+from .executor import QueryExecutor
 from .lexer import Lexer
 from .parser import Parser
+from .result import QueryResult
+from .storage import StorageEngine, Table
 from .types import RowDict
 
 
-def execute_sql(sql: str) -> list[RowDict] | int | None:
-    lexer = Lexer(sql)
-    tokens = lexer.tokenize()
-    parser = Parser(tokens)
-    statement = parser.parse()
+class Database:
+    """Directory-scoped TxtSQL database session (ready for CLI, GUI, and tests)."""
 
-    match statement:
-        case CreateTable():     return execute_create(statement)
-        case DropTable():       execute_drop(statement); return None
-        case InsertValues():    execute_insert(statement); return None
-        case DeleteStatement(): return execute_delete(statement)
-        case SelectStatement(): return execute_select(statement)
-        case UnionStatement():  return execute_union(statement)
-        case UpdateStatement(): return execute_update(statement)
-        case ImportStatement(): return execute_import(statement)
-        case ShowTables():      return execute_show_tables(statement)
-        case DescribeTable():   return execute_describe(statement)
-        case _: raise EngineError(f'Unsupported statement type: {type(statement)}')
+    def __init__(self, data_dir: str | os.PathLike[str] = '.') -> None:
+        self.storage = StorageEngine(data_dir)
+        self.executor = QueryExecutor(self.storage)
+
+    @property
+    def data_dir(self) -> Path:
+        return self.storage.data_dir
+
+    def execute(self, sql: str) -> QueryResult:
+        """Lex, parse, and execute a SQL statement, returning a structured QueryResult."""
+        tokens = Lexer(sql).tokenize()
+        statement = Parser(tokens).parse()
+        return self.executor.execute(statement)
+
+    def list_tables(self) -> list[tuple[str, int, dict[str, str]]]:
+        """Return metadata for all tables in this database directory."""
+        return self.storage.list_tables()
+
+    def get_table(self, name: str) -> Table | None:
+        """Return a Table handle for the named table, or None if missing."""
+        return self.storage.get_table(name)
+
+
+def execute_sql(sql: str, data_dir: str | os.PathLike[str] = '.') -> list[RowDict] | int | None:
+    """Execute a SQL statement and return the legacy list/int/None representation."""
+    return Database(data_dir).execute(sql).to_legacy()

@@ -1,6 +1,7 @@
 """Expression evaluator: AST -> row predicates and computed values."""
 
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from .ast import (
@@ -14,66 +15,72 @@ from .types import Types, RowDict, DataValue
 
 
 # ======================================================================
-# Public API
+# Context & Public API
 # ======================================================================
 
 SubqueryExecutor = Callable[[Expression, RowDict | None], list[RowDict]] | None
 AggregateEvaluator = Callable[[AggregateExpression], DataValue] | None
 
 
+@dataclass(frozen=True, slots=True)
+class EvalContext:
+    """Immutable evaluation context passed through expression evaluation."""
+    table_defs: dict[str, Types] | None = None
+    subquery_exec: SubqueryExecutor = None
+    agg_eval: AggregateEvaluator = None
+    outer_row: RowDict | None = None
+    valid_single_qualifier: str | None = None
+
+    def with_agg(self, agg_eval: AggregateEvaluator) -> 'EvalContext':
+        return replace(self, agg_eval=agg_eval)
+
+    def with_outer(self, outer_row: RowDict | None) -> 'EvalContext':
+        return replace(self, outer_row=outer_row)
+
+
 def evaluate_expression(
     expr: Expression,
     row: RowDict,
-    table_defs: dict[str, Types] | None = None,
-    subquery_exec: SubqueryExecutor = None,
-    agg_eval: AggregateEvaluator = None,
-    outer_row: RowDict | None = None,
-    valid_single_qualifier: str | None = None,
+    ctx: EvalContext | None = None,
 ) -> DataValue | bool:
     """Recursively evaluate any expression against a single row (with SQL 3VL)."""
+    c = ctx or EvalContext()
     match expr:
         case LiteralExpression(value):
             return value
 
         case ColumnExpression(column_name, table):
-            return _resolve_column(
+            return resolve_column(
                 row, column_name, table,
-                outer_row=outer_row,
-                valid_single_qualifier=valid_single_qualifier,
+                outer_row=c.outer_row,
+                valid_single_qualifier=c.valid_single_qualifier,
             )
 
         case AggregateExpression():
-            if agg_eval is None:
+            if c.agg_eval is None:
                 raise EngineError("Aggregate expression is not valid in this context")
-            return agg_eval(expr)
+            return c.agg_eval(expr)
 
         case BinaryExpression(left, op, right):
-            lv = evaluate_expression(
-                left, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier)
-            rv = evaluate_expression(
-                right, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier)
+            lv = evaluate_expression(left, row, c)
+            rv = evaluate_expression(right, row, c)
             return _apply_arithmetic(lv, op, rv)
 
         case NullCheckExpression(inner_expr, is_null):
-            val = evaluate_expression(
-                inner_expr, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier)
+            val = evaluate_expression(inner_expr, row, c)
             return (val is None) == is_null
 
         case ConditionExpression(left, op, right):
-            lv = evaluate_expression(
-                left, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier)
-            rv = evaluate_expression(
-                right, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier)
+            lv = evaluate_expression(left, row, c)
+            rv = evaluate_expression(right, row, c)
             return _compare(lv, rv, op)
 
         case LogicalExpression(left, op, right):
-            lval = _to_tristate(evaluate_expression(
-                left, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier))
+            lval = _to_tristate(evaluate_expression(left, row, c))
             if op == LogicalOp.AND:
                 if lval is False:
                     return False
-                rval = _to_tristate(evaluate_expression(
-                    right, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier))
+                rval = _to_tristate(evaluate_expression(right, row, c))
                 if rval is False:
                     return False
                 if lval is True and rval is True:
@@ -82,8 +89,7 @@ def evaluate_expression(
             else:  # OR
                 if lval is True:
                     return True
-                rval = _to_tristate(evaluate_expression(
-                    right, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier))
+                rval = _to_tristate(evaluate_expression(right, row, c))
                 if rval is True:
                     return True
                 if lval is False and rval is False:
@@ -91,13 +97,13 @@ def evaluate_expression(
                 return None
 
         case InExpression(inner_expr, subquery_stmt, not_in):
-            if subquery_exec is None:
+            if c.subquery_exec is None:
                 raise EngineError("Subquery execution not available")
-            sub_rows = subquery_exec(subquery_stmt, _build_outer_row(row, outer_row, valid_single_qualifier))
+            sub_rows = c.subquery_exec(
+                subquery_stmt, _build_outer_row(row, c.outer_row, c.valid_single_qualifier))
             if not sub_rows:
                 return True if not_in else False
-            val = evaluate_expression(
-                inner_expr, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier)
+            val = evaluate_expression(inner_expr, row, c)
             has_null = False
             for r in sub_rows:
                 if len(r) != 1:
@@ -113,13 +119,13 @@ def evaluate_expression(
             return True if not_in else False
 
         case AnyAllExpression(inner_expr, op, quantifier, subquery_stmt):
-            if subquery_exec is None:
+            if c.subquery_exec is None:
                 raise EngineError("Subquery execution not available")
-            sub_rows = subquery_exec(subquery_stmt, _build_outer_row(row, outer_row, valid_single_qualifier))
+            sub_rows = c.subquery_exec(
+                subquery_stmt, _build_outer_row(row, c.outer_row, c.valid_single_qualifier))
             if not sub_rows:
                 return False if quantifier == 'ANY' else True
-            val = evaluate_expression(
-                inner_expr, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier)
+            val = evaluate_expression(inner_expr, row, c)
             has_null = False
             if quantifier == 'ANY':
                 for r in sub_rows:
@@ -143,9 +149,10 @@ def evaluate_expression(
                 return None if has_null else True
 
         case ExistsExpression(subquery_stmt, negated):
-            if subquery_exec is None:
+            if c.subquery_exec is None:
                 raise EngineError("Subquery execution not available")
-            sub_rows = subquery_exec(subquery_stmt, _build_outer_row(row, outer_row, valid_single_qualifier))
+            sub_rows = c.subquery_exec(
+                subquery_stmt, _build_outer_row(row, c.outer_row, c.valid_single_qualifier))
             exists = len(sub_rows) > 0
             return not exists if negated else exists
 
@@ -155,17 +162,14 @@ def evaluate_expression(
 
 def evaluate_where(
     expression: Expression,
-    table_defs: dict[str, Types],
-    subquery_exec: SubqueryExecutor = None,
-    agg_eval: AggregateEvaluator = None,
-    outer_row: RowDict | None = None,
-    valid_single_qualifier: str | None = None,
+    ctx: EvalContext | None = None,
 ) -> Callable[[RowDict], bool]:
     """Compile a WHERE/HAVING expression into a row predicate."""
+    c = ctx or EvalContext()
+
     def predicate(row: RowDict) -> bool:
-        val = evaluate_expression(
-            expression, row, table_defs, subquery_exec, agg_eval, outer_row, valid_single_qualifier)
-        return _to_bool(val)
+        return to_bool(evaluate_expression(expression, row, c))
+
     return predicate
 
 
@@ -184,6 +188,65 @@ def resolve_column_name(expr: Expression) -> str | None:
         case LiteralExpression(value):
             return str(value) if value is not None else 'NULL'
     return None
+
+
+def resolve_column(
+    row: RowDict,
+    column_name: str,
+    table: str | None = None,
+    outer_row: RowDict | None = None,
+    valid_single_qualifier: str | None = None,
+) -> DataValue:
+    """Resolve a column reference against a possibly table-prefixed row."""
+    if table is not None:
+        key = f"{table}.{column_name}"
+        if key in row:
+            return row[key]
+        # Single-table rows are stored unprefixed; verify qualifier matches table/alias.
+        if column_name in row and not any('.' in k for k in row):
+            if valid_single_qualifier is None or table == valid_single_qualifier:
+                return row[column_name]
+        if outer_row is not None:
+            return resolve_column(outer_row, column_name, table)
+        raise ColumnNotFoundError(f'Column does not exist: {key}')
+
+    # Unqualified column lookup
+    if column_name in row:
+        return row[column_name]
+
+    candidates = [value for key, value in row.items() if key.endswith(f".{column_name}")]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise EngineError(f'Ambiguous column name: {column_name}')
+
+    if outer_row is not None:
+        return resolve_column(outer_row, column_name, None)
+
+    raise ColumnNotFoundError(f'Column does not exist: {column_name}')
+
+
+def is_number(value: object) -> bool:
+    """Return whether value is treated as a numeric value (includes bool 0/1)."""
+    return isinstance(value, (int, float, Decimal, bool))
+
+
+def to_decimal(value: object) -> Decimal:
+    """Convert numeric value (including bool 0/1) to Decimal."""
+    if isinstance(value, bool):
+        return Decimal(1) if value else Decimal(0)
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    raise TypeMismatchError(f'Expected NUMBER value, got {type(value).__name__}')
+
+
+def to_bool(value: object) -> bool:
+    """Collapse SQL three-valued logic to Python bool (UNKNOWN -> False)."""
+    return _to_tristate(value) is True
 
 
 # ======================================================================
@@ -205,58 +268,6 @@ def _build_outer_row(
     return merged
 
 
-def _resolve_column(
-    row: RowDict,
-    column_name: str,
-    table: str | None = None,
-    outer_row: RowDict | None = None,
-    valid_single_qualifier: str | None = None,
-) -> DataValue:
-    """Resolve a column reference against a possibly table-prefixed row."""
-    if table is not None:
-        key = f"{table}.{column_name}"
-        if key in row:
-            return row[key]
-        # Single-table rows are stored unprefixed; verify qualifier matches table/alias.
-        if column_name in row and not any('.' in k for k in row):
-            if valid_single_qualifier is None or table == valid_single_qualifier:
-                return row[column_name]
-        if outer_row is not None:
-            return _resolve_column(outer_row, column_name, table)
-        raise ColumnNotFoundError(f'Column does not exist: {key}')
-
-    # Unqualified column lookup
-    if column_name in row:
-        return row[column_name]
-
-    candidates = [value for key, value in row.items() if key.endswith(f".{column_name}")]
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        raise EngineError(f'Ambiguous column name: {column_name}')
-
-    if outer_row is not None:
-        return _resolve_column(outer_row, column_name, None)
-
-    raise ColumnNotFoundError(f'Column does not exist: {column_name}')
-
-
-def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float, Decimal, bool))
-
-
-def _to_decimal(value: object) -> Decimal:
-    if isinstance(value, bool):
-        return Decimal(1) if value else Decimal(0)
-    if isinstance(value, Decimal):
-        return value
-    if isinstance(value, int):
-        return Decimal(value)
-    if isinstance(value, float):
-        return Decimal(str(value))
-    raise TypeMismatchError(f'Expected NUMBER value, got {type(value).__name__}')
-
-
 def _to_tristate(value: object) -> bool | None:
     if value is None:
         return None
@@ -269,18 +280,14 @@ def _to_tristate(value: object) -> bool | None:
     return bool(value)
 
 
-def _to_bool(value: object) -> bool:
-    return _to_tristate(value) is True
-
-
 def _apply_arithmetic(left: object, op: ArithmeticOp, right: object) -> DataValue:
     """Apply arithmetic operation, treating NULL as NULL propagation."""
     if left is None or right is None:
         return None
-    if not _is_number(left) or not _is_number(right):
+    if not is_number(left) or not is_number(right):
         raise TypeMismatchError(
             f"Arithmetic requires NUMBER types, got {type(left).__name__} and {type(right).__name__}")
-    lv, rv = _to_decimal(left), _to_decimal(right)
+    lv, rv = to_decimal(left), to_decimal(right)
     match op:
         case ArithmeticOp.ADD: return lv + rv
         case ArithmeticOp.SUB: return lv - rv
@@ -296,9 +303,9 @@ def _compare(left: object, right: object, op: ComparisonOp) -> bool | None:
     if left is None or right is None:
         return None
 
-    if _is_number(left) and _is_number(right):
-        l_val = _to_decimal(left)
-        r_val = _to_decimal(right)
+    if is_number(left) and is_number(right):
+        l_val = to_decimal(left)
+        r_val = to_decimal(right)
     elif isinstance(left, str) and isinstance(right, str):
         l_val = left
         r_val = right
