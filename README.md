@@ -66,9 +66,9 @@ txtsql> SELECT * FROM employees ORDER BY salary DESC
 ### CREATE TABLE
 
 ```sql
-CREATE TABLE table_name (col1 TYPE, col2 TYPE, ...);
+CREATE TABLE [IF NOT EXISTS] table_name (col1 TYPE, col2 TYPE, ...);
 ```
-Types: `STRING`, `NUMBER`
+Types: `STRING`, `NUMBER` (`INT` / `DECIMAL` / `VARCHAR` accepted as aliases)
 
 ### INSERT
 
@@ -76,20 +76,21 @@ Types: `STRING`, `NUMBER`
 INSERT INTO table_name VALUES (val1, val2, ...);
 INSERT INTO table_name (col1, col2) VALUES (val1, val2);
 INSERT INTO table_name VALUES (1, 'a'), (2, 'b');
+INSERT INTO dst (id, name) SELECT id, name FROM src WHERE active = TRUE;
 ```
-Values: `'string'`, `42`, `3.14`, `NULL`, `TRUE`, `FALSE`
+Values: `'string'`, `42`, `3.14`, `-5`, `NULL`, `TRUE`, `FALSE`
 
 ### SELECT
 
 ```sql
-SELECT [DISTINCT] col1, col2, ... FROM table_name
+SELECT [DISTINCT] *, table.*, col1, col2, ... FROM table_name
     [WHERE condition]
     [GROUP BY col, ...]
     [HAVING aggregate_condition]
     [ORDER BY col [ASC|DESC], ...]
     [LIMIT n] [OFFSET n];
 
-SELECT COUNT(*) AS cnt FROM table_name;
+SELECT COUNT(*) AS cnt, COUNT(DISTINCT dept) AS depts FROM emp;
 SELECT COUNT(*), dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept HAVING COUNT(*) > 1;
 ```
 
@@ -98,6 +99,7 @@ SELECT COUNT(*), dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept HAVING COUN
 ```sql
 SELECT * FROM a WHERE id IN (SELECT id FROM b);
 SELECT * FROM a WHERE EXISTS (SELECT * FROM b WHERE b.id = a.id);
+SELECT * FROM a WHERE salary > (SELECT AVG(salary) FROM a);
 SELECT * FROM a WHERE score > ANY (SELECT min_score FROM thresholds);
 SELECT id, name FROM a UNION SELECT id, name FROM b ORDER BY id;
 SELECT id, name FROM a UNION ALL SELECT id, name FROM b;
@@ -124,7 +126,7 @@ SELECT * FROM a, b WHERE a.id = b.id;   -- comma is a cross join + WHERE
 ### UPDATE
 
 ```sql
-UPDATE table_name SET col1 = val1, col2 = val2 [WHERE condition];
+UPDATE table_name SET col1 = expr1, col2 = expr2 [WHERE condition];
 ```
 
 ### DELETE
@@ -136,7 +138,7 @@ DELETE FROM table_name [WHERE condition];
 ### DROP TABLE
 
 ```sql
-DROP TABLE table_name;
+DROP TABLE [IF EXISTS] table_name;
 ```
 
 ### SHOW TABLES / DESCRIBE (system commands)
@@ -171,8 +173,9 @@ SELECT dept, AVG(salary) AS avg FROM emp GROUP BY dept INTO OUTFILE 'report.csv'
 ### WHERE / HAVING expressions
 
 ```sql
-WHERE salary > 50000 AND name <> 'Bob'
-WHERE dept = 'Sales' OR dept != 'Eng'
+WHERE salary > 50000 AND NOT (name = 'Bob')
+WHERE dept IN ('Sales', 'Eng') OR dept != 'HR'
+WHERE salary BETWEEN 5000 AND 10000 AND name LIKE 'A%'
 WHERE score IS NULL
 WHERE (a > 1 AND b < 2) OR c = 3
 WHERE price * qty > 100
@@ -180,9 +183,9 @@ WHERE price * qty > 100
 
 - `=`, `<>`, `!=`, `>`, `<`, `>=`, `<=`
 - Arithmetic operators `+`, `-`, `*`, `/` (with `NULL` propagation)
-- `AND`, `OR`, parentheses (SQL three-valued logic)
-- `IS NULL`, `IS NOT NULL`
-- `IN`, `NOT IN`, `ANY`, `ALL`, `EXISTS`, `NOT EXISTS` subqueries
+- `AND`, `OR`, `NOT`, parentheses (SQL three-valued logic)
+- `IS NULL`, `IS NOT NULL`, `[NOT] IN (list | subquery)`, `[NOT] BETWEEN ... AND ...`, `[NOT] LIKE` (`%`, `_`)
+- `ANY`, `ALL`, `EXISTS`, `NOT EXISTS`, and scalar `(SELECT ...)` subqueries
 - `TRUE` / `FALSE` literals evaluate to `NUMBER` `1` / `0`
 - Escaped single quotes (`''`) inside string literals and `--` single-line SQL comments
 

@@ -116,6 +116,16 @@ class TestStructuredQueryResult:
         assert dele.affected_rows == 1
         assert dele.to_legacy() == 1
 
+        db.execute('CREATE TABLE items_copy (id NUMBER, title STRING);')
+        ins_sel = db.execute('INSERT INTO items_copy SELECT id, title FROM items;')
+        assert ins_sel.kind == StatementKind.INSERT
+        assert ins_sel.affected_rows == 1
+        assert ins_sel.to_legacy() is None
+
+        empty_join = db.execute('SELECT items.*, items_copy.title FROM items JOIN items_copy ON items.id = items_copy.id WHERE items.id = 999;')
+        assert empty_join.columns == ('id', 'title', 'items_copy.title')
+        assert empty_join.rows == []
+
 
 class TestPublicEvaluatorAndIOHandlers:
     def test_evaluator_public_helpers_and_context(self):

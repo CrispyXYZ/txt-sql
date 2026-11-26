@@ -3,10 +3,12 @@ from decimal import Decimal
 from .ast import (
     LogicalOp, AggFunc, ComparisonOp, ArithmeticOp, JoinType, JoinClause, LiteralValue,
     Expression, LiteralExpression, ColumnExpression, BinaryExpression,
-    NullCheckExpression, ConditionExpression, LogicalExpression, AggregateExpression,
-    InExpression, AnyAllExpression, ExistsExpression,
+    NullCheckExpression, ConditionExpression, LogicalExpression, NotExpression,
+    AggregateExpression, InExpression, InListExpression, AnyAllExpression,
+    ExistsExpression, BetweenExpression, LikeExpression, ScalarSubqueryExpression,
+    StarExpression,
     WhereClause, SelectExpression, TableSource,
-    CreateTable, DropTable, InsertValues,
+    CreateTable, DropTable, InsertValues, InsertSelect,
     DeleteStatement, SelectStatement, UnionStatement, UpdateStatement, ImportStatement,
     ShowTables, DescribeTable,
     contains_aggregate, collect_non_agg_columns,
@@ -33,16 +35,16 @@ class Parser:
         self.pos += 1
         return token
 
-    def peek(self) -> TokenType:
-        if self.pos + 1 < len(self.tokens):
-            return self.tokens[self.pos + 1].type
+    def peek(self, offset: int = 1) -> TokenType:
+        if self.pos + offset < len(self.tokens):
+            return self.tokens[self.pos + offset].type
         return TokenType.EOF
 
     # ------------------------------------------------------------------
     # Top-level dispatch
     # ------------------------------------------------------------------
 
-    def parse(self) -> CreateTable | DropTable | InsertValues | DeleteStatement | SelectStatement | UnionStatement | UpdateStatement | ImportStatement | ShowTables | DescribeTable:
+    def parse(self) -> CreateTable | DropTable | InsertValues | InsertSelect | DeleteStatement | SelectStatement | UnionStatement | UpdateStatement | ImportStatement | ShowTables | DescribeTable:
         token = self.current_token()
         match token.type:
             case TokenType.CREATE:   stmt = self.create_table()
@@ -65,7 +67,7 @@ class Parser:
         return stmt
 
     # ------------------------------------------------------------------
-    # Expression parsing (precedence: OR < AND < compare/IS NULL < +/- < */ < term)
+    # Expression parsing (OR < AND < NOT < compare/IS/IN/BETWEEN/LIKE < +/- < */ < term)
     # ------------------------------------------------------------------
 
     def parse_expression(self) -> Expression:
@@ -79,11 +81,21 @@ class Parser:
         return left
 
     def parse_and(self) -> Expression:
-        left = self.parse_comparison()
+        left = self.parse_not()
         while self.current_token().type == TokenType.AND:
             self.eat(TokenType.AND)
-            left = LogicalExpression(left, LogicalOp.AND, self.parse_comparison())
+            left = LogicalExpression(left, LogicalOp.AND, self.parse_not())
         return left
+
+    def parse_not(self) -> Expression:
+        if self.current_token().type == TokenType.NOT:
+            if self.peek() == TokenType.EXISTS:
+                self.eat(TokenType.NOT)
+                self.eat(TokenType.EXISTS)
+                return ExistsExpression(self._parse_subquery(), negated=True)
+            self.eat(TokenType.NOT)
+            return NotExpression(self.parse_not())
+        return self.parse_comparison()
 
     def parse_comparison(self) -> Expression:
         left = self.parse_add()
@@ -99,15 +111,46 @@ class Parser:
             self.eat(TokenType.NULL)
             return NullCheckExpression(left, is_null)
 
-        # IN / NOT IN subquery
+        # [NOT] IN (subquery | item1, item2, ...)
         if token_type == TokenType.IN or (token_type == TokenType.NOT and self.peek() == TokenType.IN):
             not_in = False
             if token_type == TokenType.NOT:
                 self.eat(TokenType.NOT)
                 not_in = True
             self.eat(TokenType.IN)
-            sub = self._parse_subquery()
-            return InExpression(left, sub, not_in)
+            self.eat(TokenType.LPAREN)
+            if self.current_token().type == TokenType.SELECT:
+                sub = self.select_or_union(allow_outfile=False)
+                self.eat(TokenType.RPAREN)
+                return InExpression(left, sub, not_in)
+            items = [self.parse_expression()]
+            while self.current_token().type == TokenType.COMMA:
+                self.eat(TokenType.COMMA)
+                items.append(self.parse_expression())
+            self.eat(TokenType.RPAREN)
+            return InListExpression(left, items, not_in)
+
+        # [NOT] BETWEEN low AND high
+        if token_type == TokenType.BETWEEN or (token_type == TokenType.NOT and self.peek() == TokenType.BETWEEN):
+            negated = False
+            if token_type == TokenType.NOT:
+                self.eat(TokenType.NOT)
+                negated = True
+            self.eat(TokenType.BETWEEN)
+            low = self.parse_add()
+            self.eat(TokenType.AND)
+            high = self.parse_add()
+            return BetweenExpression(left, low, high, negated)
+
+        # [NOT] LIKE pattern
+        if token_type == TokenType.LIKE or (token_type == TokenType.NOT and self.peek() == TokenType.LIKE):
+            negated = False
+            if token_type == TokenType.NOT:
+                self.eat(TokenType.NOT)
+                negated = True
+            self.eat(TokenType.LIKE)
+            pattern = self.parse_add()
+            return LikeExpression(left, pattern, negated)
 
         # Comparison op
         if self._is_comparison_op(token_type):
@@ -150,21 +193,19 @@ class Parser:
     def parse_term(self) -> Expression:
         token = self.current_token()
 
-        # Parenthesized expression
+        # Parenthesized expression or scalar subquery
         if token.type == TokenType.LPAREN:
+            if self.peek() == TokenType.SELECT:
+                return ScalarSubqueryExpression(self._parse_subquery())
             self.eat(TokenType.LPAREN)
             expr = self.parse_expression()
             self.eat(TokenType.RPAREN)
             return expr
 
-        # EXISTS (subquery) / NOT EXISTS (subquery)
+        # EXISTS (subquery)
         if token.type == TokenType.EXISTS:
             self.eat(TokenType.EXISTS)
             return ExistsExpression(self._parse_subquery(), negated=False)
-        if token.type == TokenType.NOT and self.peek() == TokenType.EXISTS:
-            self.eat(TokenType.NOT)
-            self.eat(TokenType.EXISTS)
-            return ExistsExpression(self._parse_subquery(), negated=True)
 
         # Arithmetic unary: -expr or +expr
         if token.type == TokenType.MINUS:
@@ -235,19 +276,25 @@ class Parser:
     }
 
     def _parse_aggregate_call(self) -> AggregateExpression:
-        """Parse COUNT(*), COUNT(col), SUM(col), etc."""
+        """Parse COUNT(*), COUNT(DISTINCT col), SUM(col), etc."""
         func_token = self.current_token()
         self.pos += 1
         func_name = func_token.value.upper()
         func = _AGG_FUNC_TOKEN_MAP[func_name]
         self.eat(TokenType.LPAREN)
+        distinct = False
+        if self.current_token().type == TokenType.DISTINCT:
+            self.eat(TokenType.DISTINCT)
+            distinct = True
         if func == AggFunc.COUNT and self.current_token().type == TokenType.STAR:
+            if distinct:
+                raise SqlSyntaxError('COUNT(DISTINCT *) is not supported')
             self.eat(TokenType.STAR)
             col_expr: ColumnExpression | None = None
         else:
             col_expr = self._parse_column_ref()
         self.eat(TokenType.RPAREN)
-        return AggregateExpression(func, col_expr)
+        return AggregateExpression(func, col_expr, distinct=distinct)
 
     @staticmethod
     def _is_comparison_op(token_type: TokenType) -> bool:
@@ -313,6 +360,12 @@ class Parser:
     def create_table(self) -> CreateTable:
         self.eat(TokenType.CREATE)
         self.eat(TokenType.TABLE)
+        if_not_exists = False
+        if self.current_token().type == TokenType.IF:
+            self.eat(TokenType.IF)
+            self.eat(TokenType.NOT)
+            self.eat(TokenType.EXISTS)
+            if_not_exists = True
         table_name = self.eat(TokenType.IDENTIFIER).value
         self.eat(TokenType.LPAREN)
         columns = []
@@ -326,15 +379,20 @@ class Parser:
             columns.append((col_name, col_type))
         self.eat(TokenType.RPAREN)
         self._ensure_unique_names([name for name, _ in columns], 'CREATE TABLE')
-        return CreateTable(table_name, columns)
+        return CreateTable(table_name, columns, if_not_exists=if_not_exists)
 
     def drop_table(self) -> DropTable:
         self.eat(TokenType.DROP)
         self.eat(TokenType.TABLE)
+        if_exists = False
+        if self.current_token().type == TokenType.IF:
+            self.eat(TokenType.IF)
+            self.eat(TokenType.EXISTS)
+            if_exists = True
         table_name = self.eat(TokenType.IDENTIFIER).value
-        return DropTable(table_name)
+        return DropTable(table_name, if_exists=if_exists)
 
-    def insert_values(self) -> InsertValues:
+    def insert_values(self) -> InsertValues | InsertSelect:
         self.eat(TokenType.INSERT)
         self.eat(TokenType.INTO)
         table_name = self.eat(TokenType.IDENTIFIER).value
@@ -347,6 +405,9 @@ class Parser:
                 columns.append(self.eat(TokenType.IDENTIFIER).value)
             self.eat(TokenType.RPAREN)
             self._ensure_unique_names(columns, 'INSERT')
+        if self.current_token().type == TokenType.SELECT:
+            query = self.select_or_union(allow_outfile=False)
+            return InsertSelect(table_name, columns, query)
         self.eat(TokenType.VALUES)
         all_values = []
         while True:
@@ -432,16 +493,13 @@ class Parser:
             distinct = True
 
         # SELECT list
-        select_exprs: list[SelectExpression] | None
-        if self.current_token().type == TokenType.STAR:
-            self.eat(TokenType.STAR)
-            select_exprs = None
-        else:
-            select_exprs = []
+        select_exprs: list[SelectExpression] | None = []
+        self._parse_select_expression(select_exprs)
+        while self.current_token().type == TokenType.COMMA:
+            self.eat(TokenType.COMMA)
             self._parse_select_expression(select_exprs)
-            while self.current_token().type == TokenType.COMMA:
-                self.eat(TokenType.COMMA)
-                self._parse_select_expression(select_exprs)
+        if len(select_exprs) == 1 and isinstance(select_exprs[0].expr, StarExpression) and select_exprs[0].expr.table is None:
+            select_exprs = None
 
         # FROM clause
         self.eat(TokenType.FROM)
@@ -547,6 +605,9 @@ class Parser:
             raise SqlSyntaxError('SELECT * cannot be used with GROUP BY')
 
         has_agg_in_select = any(contains_aggregate(se.expr) for se in (select_exprs or []))
+        has_wildcard = select_exprs is not None and any(isinstance(se.expr, StarExpression) for se in select_exprs)
+        if has_wildcard and (group_by is not None or has_agg_in_select):
+            raise SqlSyntaxError('Wildcard (*) cannot be used with GROUP BY or aggregate functions')
         if select_exprs is not None:
             non_agg_cols = [
                 col
@@ -631,7 +692,21 @@ class Parser:
         return TableSource(name, alias)
 
     def _parse_select_expression(self, select_exprs: list[SelectExpression]) -> None:
-        """Parse one SELECT list item: expression [AS alias]."""
+        """Parse one SELECT list item: *, table.*, or expression [AS alias]."""
+        if self.current_token().type == TokenType.STAR:
+            self.eat(TokenType.STAR)
+            select_exprs.append(SelectExpression(StarExpression(None), None))
+            return
+        if (
+            self.current_token().type == TokenType.IDENTIFIER
+            and self.peek(1) == TokenType.DOT
+            and self.peek(2) == TokenType.STAR
+        ):
+            table = self.eat(TokenType.IDENTIFIER).value
+            self.eat(TokenType.DOT)
+            self.eat(TokenType.STAR)
+            select_exprs.append(SelectExpression(StarExpression(table), None))
+            return
         expr = self.parse_expression()
         alias = None
         if self.current_token().type == TokenType.AS:
@@ -660,15 +735,21 @@ class Parser:
         self.eat(TokenType.UPDATE)
         table_name = self.eat(TokenType.IDENTIFIER).value
         self.eat(TokenType.SET)
-        set_clauses: list[tuple[str, LiteralValue]] = []
+        set_clauses: list[tuple[str, Expression]] = []
         col = self.eat(TokenType.IDENTIFIER).value
         self.eat(TokenType.EQ)
-        set_clauses.append((col, self._parse_literal_value()))
+        val_expr = self.parse_expression()
+        if contains_aggregate(val_expr):
+            raise SqlSyntaxError('Aggregate functions are not allowed in UPDATE SET clause')
+        set_clauses.append((col, val_expr))
         while self.current_token().type == TokenType.COMMA:
             self.eat(TokenType.COMMA)
             col = self.eat(TokenType.IDENTIFIER).value
             self.eat(TokenType.EQ)
-            set_clauses.append((col, self._parse_literal_value()))
+            val_expr = self.parse_expression()
+            if contains_aggregate(val_expr):
+                raise SqlSyntaxError('Aggregate functions are not allowed in UPDATE SET clause')
+            set_clauses.append((col, val_expr))
         where_clause = None
         if self.current_token().type == TokenType.WHERE:
             self.eat(TokenType.WHERE)

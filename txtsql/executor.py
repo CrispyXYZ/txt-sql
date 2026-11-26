@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from .ast import (
-    DropTable, CreateTable, InsertValues, DeleteStatement, SelectStatement,
+    DropTable, CreateTable, InsertValues, InsertSelect, DeleteStatement, SelectStatement,
     UnionStatement, UpdateStatement, ImportStatement, ShowTables, DescribeTable,
-    AggFunc, AggregateExpression, ColumnExpression,
+    AggFunc, AggregateExpression, ColumnExpression, LiteralExpression, StarExpression,
     JoinClause, JoinType, SelectExpression,
     contains_aggregate,
 )
@@ -14,7 +14,7 @@ from .evaluator import (
     EvalContext, evaluate_where, evaluate_expression, resolve_column_name,
     resolve_column, to_bool, to_decimal,
 )
-from .exceptions import ColumnNotFoundError, TableNotFoundError, EngineError, TypeMismatchError
+from .exceptions import ColumnNotFoundError, TableAlreadyExistsError, TableNotFoundError, EngineError, TypeMismatchError
 from .io_handlers import export_rows, read_excel_table
 from .result import QueryResult, StatementKind
 from .storage import StorageEngine, Table
@@ -24,7 +24,7 @@ from .types import Types, RowDict, DataValue
 _TYPE_MAP = {'STRING': Types.STRING, 'NUMBER': Types.NUMBER}
 
 Statement = (
-    CreateTable | DropTable | InsertValues | DeleteStatement |
+    CreateTable | DropTable | InsertValues | InsertSelect | DeleteStatement |
     SelectStatement | UnionStatement | UpdateStatement |
     ImportStatement | ShowTables | DescribeTable
 )
@@ -54,6 +54,8 @@ class QueryExecutor:
                 return self.execute_drop(statement)
             case InsertValues():
                 return self.execute_insert(statement)
+            case InsertSelect():
+                return self.execute_insert_select(statement)
             case DeleteStatement():
                 return self.execute_delete(statement)
             case UpdateStatement():
@@ -77,11 +79,19 @@ class QueryExecutor:
 
     def execute_create(self, statement: CreateTable) -> QueryResult:
         defs = {col_name: _TYPE_MAP[type_str] for col_name, type_str in statement.columns}
-        self.storage.create_table(statement.table_name, defs)
+        try:
+            self.storage.create_table(statement.table_name, defs)
+        except TableAlreadyExistsError:
+            if not statement.if_not_exists:
+                raise
         return QueryResult(kind=StatementKind.DDL)
 
     def execute_drop(self, statement: DropTable) -> QueryResult:
-        self.storage.drop_table(statement.table_name)
+        try:
+            self.storage.drop_table(statement.table_name)
+        except TableNotFoundError:
+            if not statement.if_exists:
+                raise
         return QueryResult(kind=StatementKind.DDL)
 
     def execute_insert(self, statement: InsertValues) -> QueryResult:
@@ -114,6 +124,43 @@ class QueryExecutor:
             message=f'{count} rows inserted.',
         )
 
+    def execute_insert_select(self, statement: InsertSelect) -> QueryResult:
+        table = self._get_table(statement.table_name)
+        all_columns = table.column_names()
+
+        if statement.columns is None:
+            target_columns = all_columns
+        else:
+            for col in statement.columns:
+                if col not in all_columns:
+                    raise ColumnNotFoundError(f'Column does not exist: {col}')
+            target_columns = statement.columns
+
+        # Materialize full source query before writing to avoid self-insert feedback loops.
+        query_res = (
+            self.execute_select_result(statement.query)
+            if isinstance(statement.query, SelectStatement)
+            else self.execute_union_result(statement.query)
+        )
+        if len(query_res.columns) != len(target_columns):
+            raise EngineError('Column count mismatch')
+
+        prepared_rows: list[RowDict] = []
+        for src_row in query_res.rows:
+            row_data: RowDict = {col: val for col, val in zip(target_columns, src_row.values())}
+            for col in all_columns:
+                if col not in row_data:
+                    row_data[col] = None
+            prepared_rows.append(row_data)
+
+        table.insert_rows(prepared_rows)
+        count = len(prepared_rows)
+        return QueryResult(
+            kind=StatementKind.INSERT,
+            affected_rows=count,
+            message=f'{count} rows inserted.',
+        )
+
     def execute_delete(self, statement: DeleteStatement) -> QueryResult:
         table = self._get_table(statement.table_name)
         where_func = None
@@ -133,20 +180,26 @@ class QueryExecutor:
 
     def execute_update(self, statement: UpdateStatement) -> QueryResult:
         table = self._get_table(statement.table_name)
-        all_columns = table.column_names()
-        for col, _ in statement.set_clauses:
-            if col not in all_columns:
+        col_types = table.column_types()
+        for col, expr in statement.set_clauses:
+            if col not in col_types:
                 raise ColumnNotFoundError(f'Column does not exist: {col}')
+            if isinstance(expr, LiteralExpression):
+                _validate_literal_type(expr.value, col_types[col])
+
+        ctx = EvalContext(
+            table_defs=col_types,
+            subquery_exec=self._exec_subquery,
+            valid_single_qualifier=statement.table_name,
+        )
         where_func = None
         if statement.where_clause is not None:
-            ctx = EvalContext(
-                table_defs=table.column_types(),
-                subquery_exec=self._exec_subquery,
-                valid_single_qualifier=statement.table_name,
-            )
             where_func = evaluate_where(statement.where_clause.expression, ctx)
-        values: RowDict = {col: val for col, val in statement.set_clauses}
-        updated = table.update(values, where=where_func)
+
+        def _updater(row_dict: RowDict) -> RowDict:
+            return {col: evaluate_expression(expr, row_dict, ctx) for col, expr in statement.set_clauses}
+
+        updated = table.update_rows(_updater, where=where_func)
         return QueryResult(
             kind=StatementKind.UPDATE,
             affected_rows=updated,
@@ -370,8 +423,26 @@ class QueryExecutor:
             where_func = evaluate_where(statement.where_clause.expression, base_ctx)
             combined = [r for r in combined if where_func(r)]
 
-        has_agg_in_select = statement.columns is not None and any(
-            contains_aggregate(se.expr) for se in statement.columns
+        table_columns_map: dict[str, list[str]] = {}
+        for src, t in zip(sources, tables[:len(sources)]):
+            table_columns_map[src.alias or src.name] = t.column_names()
+        for jc, t in zip(statement.joins, tables[len(sources):]):
+            table_columns_map[jc.source.alias or jc.source.name] = t.column_names()
+
+        expanded_columns = (
+            _expand_select_expressions(
+                statement.columns,
+                tables[0].column_names(),
+                table_columns_map,
+                visible_columns,
+                use_prefixes,
+            )
+            if statement.columns is not None
+            else None
+        )
+
+        has_agg_in_select = expanded_columns is not None and any(
+            contains_aggregate(se.expr) for se in expanded_columns
         )
         has_agg_in_having = statement.having is not None and contains_aggregate(statement.having.expression)
         is_grouped = has_agg_in_select or statement.group_by is not None or has_agg_in_having
@@ -379,9 +450,9 @@ class QueryExecutor:
         paired: list[tuple[RowDict, RowDict]] = []
 
         if not is_grouped:
-            if statement.columns is not None:
+            if expanded_columns is not None:
                 for row in combined:
-                    proj = _project_select_expressions(row, statement.columns, base_ctx)
+                    proj = _project_select_expressions(row, expanded_columns, base_ctx)
                     paired.append((row, proj))
             elif visible_columns is not None:
                 projected = _project_star(combined, visible_columns)
@@ -396,8 +467,8 @@ class QueryExecutor:
 
                 group_ctx = base_ctx.with_agg(_agg_eval)
 
-                if statement.columns is not None:
-                    proj = _project_select_expressions(rep_row, statement.columns, group_ctx)
+                if expanded_columns is not None:
+                    proj = _project_select_expressions(rep_row, expanded_columns, group_ctx)
                 else:
                     proj = dict(rep_row)
 
@@ -427,8 +498,8 @@ class QueryExecutor:
 
         if result:
             headers = list(result[0].keys())
-        elif statement.columns is not None:
-            headers = _compute_select_headers(statement.columns)
+        elif expanded_columns is not None:
+            headers = _compute_select_headers(expanded_columns)
         elif visible_columns is not None:
             headers = _compute_star_headers(visible_columns)
         else:
@@ -518,6 +589,50 @@ class QueryExecutor:
 # Pure aggregation, projection, dedup, ordering, and JOIN helpers
 # ======================================================================
 
+def _validate_literal_type(value: DataValue, col_type: Types) -> None:
+    if value is None:
+        return
+    if col_type == Types.NUMBER:
+        to_decimal(value)
+    elif col_type == Types.STRING and not isinstance(value, str):
+        raise TypeMismatchError(f'Expected STRING value, got {type(value).__name__}')
+
+
+def _expand_select_expressions(
+    select_exprs: list[SelectExpression],
+    single_table_columns: list[str],
+    table_columns_map: dict[str, list[str]],
+    visible_columns: list[_VisibleColumn] | None,
+    use_prefixes: bool,
+) -> list[SelectExpression]:
+    """Expand * and table.* wildcards into concrete ColumnExpression items."""
+    expanded: list[SelectExpression] = []
+    for se in select_exprs:
+        if not isinstance(se.expr, StarExpression):
+            expanded.append(se)
+            continue
+        target_table = se.expr.table
+        if target_table is None:
+            if visible_columns is not None:
+                for col in visible_columns:
+                    col_expr = (
+                        ColumnExpression(col.name, None)
+                        if col.coalesce_keys
+                        else ColumnExpression(col.name, col.qualifier)
+                    )
+                    expanded.append(SelectExpression(col_expr, None))
+            else:
+                for col_name in single_table_columns:
+                    expanded.append(SelectExpression(ColumnExpression(col_name, None), None))
+        else:
+            if target_table not in table_columns_map:
+                raise TableNotFoundError(f'Unknown table or alias: {target_table}')
+            for col_name in table_columns_map[target_table]:
+                col_expr = ColumnExpression(col_name, target_table if use_prefixes else target_table)
+                expanded.append(SelectExpression(col_expr, None))
+    return expanded
+
+
 def _eval_aggregate(
     agg_expr: AggregateExpression,
     group_rows: list[RowDict],
@@ -531,6 +646,16 @@ def _eval_aggregate(
     ctx = EvalContext(valid_single_qualifier=valid_single_qualifier)
     vals = [evaluate_expression(col, r, ctx) for r in group_rows]
     non_null = [v for v in vals if v is not None]
+
+    if agg_expr.distinct:
+        seen = set()
+        deduped: list[DataValue] = []
+        for v in non_null:
+            key = (1, v) if isinstance(v, Decimal) else (2, v)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(v)
+        non_null = deduped
 
     match func:
         case AggFunc.COUNT:

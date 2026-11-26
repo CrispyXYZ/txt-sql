@@ -1324,3 +1324,241 @@ class TestSystemCommandsImportExport:
         assert sheet_rows[2][0] == 2 and sheet_rows[2][1] in (None, '')
         execute_sql('DROP TABLE exp;')
 
+
+# ---------------------------------------------------------------------------
+# B1 SQL Completeness: NOT, IN list, BETWEEN, LIKE, UPDATE expr, INSERT SELECT,
+# IF [NOT] EXISTS, SELECT table.*, scalar subquery, COUNT(DISTINCT col)
+# ---------------------------------------------------------------------------
+
+class TestPredicatesNotInBetweenLike:
+    def setup_method(self):
+        execute_sql('CREATE TABLE items (id NUMBER, name STRING, price NUMBER);')
+        execute_sql(
+            "INSERT INTO items VALUES "
+            "(1, 'apple', 10), "
+            "(2, 'apricot', 20), "
+            "(3, 'banana', 30), "
+            "(4, 'a.b[1]', NULL), "
+            "(5, 'line1\nline2', 50), "
+            "(6, NULL, 60);"
+        )
+
+    def teardown_method(self):
+        try: execute_sql('DROP TABLE items')
+        except Exception: pass
+
+    def test_logical_not_and_3vl(self):
+        # NOT binds tighter than AND / OR; NOT UNKNOWN -> UNKNOWN
+        rows = execute_sql('SELECT id FROM items WHERE NOT id = 1 AND price <= 30 ORDER BY id ASC;')
+        assert [r['id'] for r in rows] == [Decimal('2'), Decimal('3')]
+
+        # Double negation and NULL: NOT (price = 10) is UNKNOWN when price IS NULL
+        rows2 = execute_sql('SELECT id FROM items WHERE NOT (price = 10) ORDER BY id ASC;')
+        assert [r['id'] for r in rows2] == [Decimal('2'), Decimal('3'), Decimal('5'), Decimal('6')]
+
+        rows3 = execute_sql('SELECT id FROM items WHERE NOT NOT (id = 1);')
+        assert [r['id'] for r in rows3] == [Decimal('1')]
+
+    def test_in_and_not_in_list_with_expressions_and_nulls(self):
+        rows = execute_sql('SELECT id FROM items WHERE id IN (1, 1 + 2, 99) ORDER BY id ASC;')
+        assert [r['id'] for r in rows] == [Decimal('1'), Decimal('3')]
+
+        # 10 NOT IN (20, NULL) -> UNKNOWN (excluded)
+        assert execute_sql('SELECT id FROM items WHERE price NOT IN (20, NULL);') == []
+
+        # 20 NOT IN (20, NULL) -> FALSE (excluded); 10 NOT IN (20, 30) -> TRUE
+        rows_not = execute_sql('SELECT id FROM items WHERE price NOT IN (20, 30) ORDER BY id ASC;')
+        assert [r['id'] for r in rows_not] == [Decimal('1'), Decimal('5'), Decimal('6')]
+
+        with pytest.raises(TypeMismatchError):
+            execute_sql("SELECT id FROM items WHERE id IN ('bad');")
+
+    def test_between_and_not_between_with_3vl(self):
+        # Inclusive bounds + combined with logical AND
+        rows = execute_sql('SELECT id FROM items WHERE price BETWEEN 10 AND 30 AND id >= 2 ORDER BY id ASC;')
+        assert [r['id'] for r in rows] == [Decimal('2'), Decimal('3')]
+
+        rows_str = execute_sql("SELECT id FROM items WHERE name BETWEEN 'apple' AND 'banana' ORDER BY id ASC;")
+        assert [r['id'] for r in rows_str] == [Decimal('1'), Decimal('2'), Decimal('3')]
+
+        # 10 BETWEEN NULL AND 5 -> UNKNOWN AND FALSE -> FALSE -> NOT BETWEEN is TRUE!
+        rows_not = execute_sql('SELECT id FROM items WHERE price NOT BETWEEN NULL AND 15 ORDER BY id ASC;')
+        assert [r['id'] for r in rows_not] == [Decimal('2'), Decimal('3'), Decimal('5'), Decimal('6')]
+
+        # 20 BETWEEN NULL AND 50 -> UNKNOWN -> excluded
+        assert execute_sql('SELECT id FROM items WHERE price BETWEEN NULL AND 50;') == []
+
+    def test_like_and_not_like_wildcards_multiline_and_regex_chars(self):
+        rows = execute_sql("SELECT id FROM items WHERE name LIKE 'ap%' ORDER BY id ASC;")
+        assert [r['id'] for r in rows] == [Decimal('1'), Decimal('2')]
+
+        rows_underscore = execute_sql("SELECT id FROM items WHERE name LIKE 'ap_le';")
+        assert [r['id'] for r in rows_underscore] == [Decimal('1')]
+
+        # Regex metacharacters (., [, ]) must be treated literally
+        rows_lit = execute_sql("SELECT id FROM items WHERE name LIKE 'a.b[1]';")
+        assert [r['id'] for r in rows_lit] == [Decimal('4')]
+
+        # Multiline string matched by % under re.DOTALL
+        rows_nl = execute_sql("SELECT id FROM items WHERE name LIKE 'line1%line2';")
+        assert [r['id'] for r in rows_nl] == [Decimal('5')]
+
+        # NOT LIKE excludes NULL names (3VL)
+        rows_not = execute_sql("SELECT id FROM items WHERE name NOT LIKE 'ap%' ORDER BY id ASC;")
+        assert [r['id'] for r in rows_not] == [Decimal('3'), Decimal('4'), Decimal('5')]
+
+        with pytest.raises(TypeMismatchError):
+            execute_sql("SELECT id FROM items WHERE id LIKE '1%';")
+
+
+class TestDmlDdlEnhancementsAndAggregates:
+    def test_create_if_not_exists_and_drop_if_exists(self):
+        execute_sql('CREATE TABLE IF NOT EXISTS t (id NUMBER);')
+        execute_sql('INSERT INTO t VALUES (1);')
+        # Should not raise and should preserve existing data
+        execute_sql('CREATE TABLE IF NOT EXISTS t (id NUMBER, extra STRING);')
+        assert execute_sql('SELECT * FROM t;') == [{'id': Decimal('1')}]
+
+        execute_sql('DROP TABLE IF EXISTS t;')
+        execute_sql('DROP TABLE IF EXISTS t;')  # no-op when already gone
+
+    def test_update_set_expressions_and_atomicity(self):
+        execute_sql('CREATE TABLE emp (id NUMBER, salary NUMBER, bonus NUMBER, tag STRING);')
+        execute_sql("INSERT INTO emp VALUES (1, 1000, 100, 'A'), (2, 2000, 200, 'B');")
+
+        # Both columns evaluate against old row state; scalar subquery also works
+        updated = execute_sql(
+            'UPDATE emp SET salary = salary * 1.1, bonus = salary / 10 '
+            'WHERE id = (SELECT MIN(id) FROM emp);'
+        )
+        assert updated == 1
+        rows = execute_sql('SELECT * FROM emp ORDER BY id ASC;')
+        assert rows[0]['salary'] == Decimal('1100.0')
+        assert rows[0]['bonus'] == Decimal('100')  # computed from old salary=1000
+
+        # Division by zero or type mismatch aborts whole UPDATE without partial write
+        with pytest.raises(TypeMismatchError):
+            execute_sql('UPDATE emp SET salary = salary / (id - 2);')
+        assert execute_sql('SELECT salary FROM emp WHERE id = 1;') == [{'salary': Decimal('1100.0')}]
+
+        # Literal type mismatch rejected even when WHERE matches 0 rows
+        with pytest.raises(TypeMismatchError):
+            execute_sql("UPDATE emp SET salary = 'bad' WHERE id = 999;")
+
+        with pytest.raises(SqlSyntaxError):
+            execute_sql('UPDATE emp SET salary = COUNT(*);')
+
+        execute_sql('DROP TABLE emp;')
+
+    def test_insert_into_select_and_self_insert(self):
+        execute_sql('CREATE TABLE src (id NUMBER, name STRING);')
+        execute_sql("INSERT INTO src VALUES (1, 'Alice'), (2, 'Bob');")
+        execute_sql('CREATE TABLE dst (id NUMBER, name STRING, note STRING);')
+
+        execute_sql("INSERT INTO dst (id, name) SELECT id, name FROM src WHERE id >= 1;")
+        assert execute_sql('SELECT * FROM dst ORDER BY id ASC;') == [
+            {'id': Decimal('1'), 'name': 'Alice', 'note': None},
+            {'id': Decimal('2'), 'name': 'Bob', 'note': None},
+        ]
+
+        # Self-insert must materialize first and not loop infinitely
+        execute_sql('INSERT INTO src SELECT id + 10, name FROM src;')
+        assert len(execute_sql('SELECT * FROM src;')) == 4
+
+        # Empty source SELECT inserts 0 rows
+        execute_sql('INSERT INTO dst (id, name) SELECT id, name FROM src WHERE id = 999;')
+        assert len(execute_sql('SELECT * FROM dst;')) == 2
+
+        # Column count mismatch & type mismatch
+        with pytest.raises(EngineError, match='Column count'):
+            execute_sql('INSERT INTO dst SELECT id, name FROM src;')
+        with pytest.raises(TypeMismatchError):
+            execute_sql('INSERT INTO dst (id, name) SELECT name, id FROM src;')
+        assert len(execute_sql('SELECT * FROM dst;')) == 2
+
+        execute_sql('DROP TABLE src;')
+        execute_sql('DROP TABLE dst;')
+
+    def test_select_table_star_and_wildcards(self):
+        execute_sql('CREATE TABLE a (id NUMBER, val STRING);')
+        execute_sql("INSERT INTO a VALUES (1, 'x');")
+        execute_sql('CREATE TABLE b (id NUMBER, score NUMBER);')
+        execute_sql('INSERT INTO b VALUES (1, 95);')
+
+        rows = execute_sql('SELECT a.*, b.score FROM a JOIN b ON a.id = b.id;')
+        assert rows == [{'id': Decimal('1'), 'val': 'x', 'score': Decimal('95')}]
+
+        rows_both = execute_sql('SELECT a.*, b.* FROM a JOIN b ON a.id = b.id;')
+        assert list(rows_both[0].keys()) == ['id', 'val', 'b.id', 'score']
+
+        rows_single = execute_sql('SELECT t.*, id * 2 AS dbl FROM a t;')
+        assert rows_single == [{'id': Decimal('1'), 'val': 'x', 'dbl': Decimal('2')}]
+
+        with pytest.raises(TableNotFoundError):
+            execute_sql('SELECT bogus.* FROM a;')
+        with pytest.raises(SqlSyntaxError):
+            execute_sql('SELECT a.* FROM a GROUP BY id;')
+
+        execute_sql('DROP TABLE a;')
+        execute_sql('DROP TABLE b;')
+
+    def test_scalar_subquery_and_correlated_scalar_subquery(self):
+        execute_sql('CREATE TABLE emp (id NUMBER, dept STRING, salary NUMBER);')
+        execute_sql("INSERT INTO emp VALUES (1, 'Eng', 8000), (2, 'Eng', 10000), (3, 'Sales', 5000);")
+        execute_sql('CREATE TABLE empty_t (x NUMBER);')
+
+        # Scalar subquery in WHERE and SELECT
+        rows = execute_sql(
+            'SELECT id, salary - (SELECT AVG(salary) FROM emp) AS diff '
+            'FROM emp WHERE salary > (SELECT AVG(salary) FROM emp) ORDER BY id ASC;'
+        )
+        assert [r['id'] for r in rows] == [Decimal('1'), Decimal('2')]
+
+        # Correlated scalar subquery: earn more than own dept average
+        corr = execute_sql(
+            'SELECT e.id FROM emp e '
+            'WHERE e.salary > (SELECT AVG(salary) FROM emp e2 WHERE e2.dept = e.dept);'
+        )
+        assert corr == [{'id': Decimal('2')}]
+
+        # 0 rows -> NULL
+        empty_res = execute_sql('SELECT (SELECT x FROM empty_t) AS missing FROM emp LIMIT 1;')
+        assert empty_res == [{'missing': None}]
+
+        # >1 row -> EngineError
+        with pytest.raises(EngineError, match='more than one row'):
+            execute_sql('SELECT * FROM emp WHERE salary > (SELECT salary FROM emp);')
+
+        # >1 column -> EngineError
+        with pytest.raises(EngineError, match='one column'):
+            execute_sql('SELECT * FROM emp WHERE salary > (SELECT id, salary FROM emp WHERE id = 1);')
+
+        execute_sql('DROP TABLE emp;')
+        execute_sql('DROP TABLE empty_t;')
+
+    def test_count_sum_avg_distinct(self):
+        execute_sql('CREATE TABLE logs (id NUMBER, dept STRING, amt NUMBER);')
+        execute_sql(
+            "INSERT INTO logs VALUES "
+            "(1, 'Eng', 10), (2, 'Eng', 10.0), (3, 'Eng', 20), (4, 'Sales', NULL), (5, NULL, 20);"
+        )
+        rows = execute_sql(
+            'SELECT COUNT(DISTINCT dept) AS d_dept, '
+            'COUNT(DISTINCT amt) AS d_amt, '
+            'SUM(DISTINCT amt) AS s_amt, '
+            'AVG(DISTINCT amt) AS a_amt '
+            'FROM logs;'
+        )
+        assert rows == [{
+            'd_dept': Decimal('2'),
+            'd_amt': Decimal('2'),
+            's_amt': Decimal('30'),
+            'a_amt': Decimal('15'),
+        }]
+
+        with pytest.raises(SqlSyntaxError):
+            execute_sql('SELECT COUNT(DISTINCT *) FROM logs;')
+
+        execute_sql('DROP TABLE logs;')
+
+

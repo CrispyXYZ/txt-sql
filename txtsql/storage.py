@@ -289,6 +289,29 @@ class Table:
         self._write_raw_rows(table_values)
         return updated_count
 
+    def update_rows(
+        self,
+        updater: Callable[[RowDict], RowDict],
+        where: Callable[[RowDict], bool] | None = None,
+    ) -> int:
+        """Update matching rows via a per-row updater callback, validating all rows before atomic write."""
+        col_defs = list(self.defs.items())
+        table_values = self._read_raw_rows()
+        updated_count = 0
+
+        for i, raw_row in enumerate(table_values):
+            row_dict = self._row_to_dict(raw_row)
+            if where is None or where(row_dict):
+                new_vals = updater(row_dict)
+                table_values[i] = [
+                    raw_row[j] if col_name not in new_vals else _data_to_string(new_vals[col_name], col_type)
+                    for j, (col_name, col_type) in enumerate(col_defs)
+                ]
+                updated_count += 1
+
+        self._write_raw_rows(table_values)
+        return updated_count
+
     def delete(self, where: Callable[[RowDict], bool] | None = None) -> int:
         """
         Delete rows matching the where predicate.

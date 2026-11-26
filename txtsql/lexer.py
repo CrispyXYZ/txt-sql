@@ -53,7 +53,10 @@ class TokenType(StrEnum):
     ON = 'ON'
     USING = 'USING'
     IN = 'IN'
+    BETWEEN = 'BETWEEN'
+    LIKE = 'LIKE'
     EXISTS = 'EXISTS'
+    IF = 'IF'
     ANY = 'ANY'
     ALL = 'ALL'
     UNION = 'UNION'
@@ -262,8 +265,14 @@ class Lexer:
                 token_type = TokenType.USING
             case 'IN':
                 token_type = TokenType.IN
+            case 'BETWEEN':
+                token_type = TokenType.BETWEEN
+            case 'LIKE':
+                token_type = TokenType.LIKE
             case 'EXISTS':
                 token_type = TokenType.EXISTS
+            case 'IF':
+                token_type = TokenType.IF
             case 'ANY':
                 token_type = TokenType.ANY
             case 'ALL':

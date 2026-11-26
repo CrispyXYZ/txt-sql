@@ -1,13 +1,15 @@
 """Expression evaluator: AST -> row predicates and computed values."""
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from .ast import (
     Expression, LiteralExpression, ColumnExpression, BinaryExpression,
-    NullCheckExpression, ConditionExpression, LogicalExpression, AggregateExpression,
-    InExpression, AnyAllExpression, ExistsExpression,
+    NullCheckExpression, ConditionExpression, LogicalExpression, NotExpression,
+    AggregateExpression, InExpression, InListExpression, AnyAllExpression,
+    ExistsExpression, BetweenExpression, LikeExpression, ScalarSubqueryExpression,
     LogicalOp, ComparisonOp, ArithmeticOp,
 )
 from .exceptions import ColumnNotFoundError, TypeMismatchError, EngineError
@@ -70,6 +72,10 @@ def evaluate_expression(
             val = evaluate_expression(inner_expr, row, c)
             return (val is None) == is_null
 
+        case NotExpression(inner_expr):
+            val = _to_tristate(evaluate_expression(inner_expr, row, c))
+            return None if val is None else not val
+
         case ConditionExpression(left, op, right):
             lv = evaluate_expression(left, row, c)
             rv = evaluate_expression(right, row, c)
@@ -81,11 +87,7 @@ def evaluate_expression(
                 if lval is False:
                     return False
                 rval = _to_tristate(evaluate_expression(right, row, c))
-                if rval is False:
-                    return False
-                if lval is True and rval is True:
-                    return True
-                return None
+                return _tristate_and(lval, rval)
             else:  # OR
                 if lval is True:
                     return True
@@ -96,6 +98,33 @@ def evaluate_expression(
                     return False
                 return None
 
+        case BetweenExpression(inner_expr, low_expr, high_expr, negated):
+            val = evaluate_expression(inner_expr, row, c)
+            low_val = evaluate_expression(low_expr, row, c)
+            high_val = evaluate_expression(high_expr, row, c)
+            ge = _compare(val, low_val, ComparisonOp.GE)
+            le = _compare(val, high_val, ComparisonOp.LE)
+            in_range = _tristate_and(ge, le)
+            if in_range is None:
+                return None
+            return (not in_range) if negated else in_range
+
+        case LikeExpression(inner_expr, pattern_expr, negated):
+            val = evaluate_expression(inner_expr, row, c)
+            pat = evaluate_expression(pattern_expr, row, c)
+            if val is None or pat is None:
+                return None
+            if not isinstance(val, str) or not isinstance(pat, str):
+                raise TypeMismatchError(
+                    f"LIKE requires STRING types, got {type(val).__name__} and {type(pat).__name__}")
+            matched = _like_match(val, pat)
+            return (not matched) if negated else matched
+
+        case InListExpression(inner_expr, items, not_in):
+            val = evaluate_expression(inner_expr, row, c)
+            candidates = [evaluate_expression(item, row, c) for item in items]
+            return _eval_in_values(val, candidates, not_in)
+
         case InExpression(inner_expr, subquery_stmt, not_in):
             if c.subquery_exec is None:
                 raise EngineError("Subquery execution not available")
@@ -104,19 +133,12 @@ def evaluate_expression(
             if not sub_rows:
                 return True if not_in else False
             val = evaluate_expression(inner_expr, row, c)
-            has_null = False
+            candidates: list[object] = []
             for r in sub_rows:
                 if len(r) != 1:
                     raise EngineError("Subquery in IN must return exactly one column")
-                sub_val = next(iter(r.values()))
-                cmp_res = _compare(val, sub_val, ComparisonOp.EQ)
-                if cmp_res is True:
-                    return False if not_in else True
-                if cmp_res is None:
-                    has_null = True
-            if has_null:
-                return None
-            return True if not_in else False
+                candidates.append(next(iter(r.values())))
+            return _eval_in_values(val, candidates, not_in)
 
         case AnyAllExpression(inner_expr, op, quantifier, subquery_stmt):
             if c.subquery_exec is None:
@@ -156,6 +178,20 @@ def evaluate_expression(
             exists = len(sub_rows) > 0
             return not exists if negated else exists
 
+        case ScalarSubqueryExpression(subquery_stmt):
+            if c.subquery_exec is None:
+                raise EngineError("Subquery execution not available")
+            sub_rows = c.subquery_exec(
+                subquery_stmt, _build_outer_row(row, c.outer_row, c.valid_single_qualifier))
+            if not sub_rows:
+                return None
+            if len(sub_rows) > 1:
+                raise EngineError("Scalar subquery returned more than one row")
+            first_row = sub_rows[0]
+            if len(first_row) != 1:
+                raise EngineError("Scalar subquery must return exactly one column")
+            return next(iter(first_row.values()))
+
         case _:
             raise ValueError(f"Unsupported expression type: {type(expr).__name__}")
 
@@ -178,9 +214,10 @@ def resolve_column_name(expr: Expression) -> str | None:
     match expr:
         case ColumnExpression(column_name, _):
             return column_name
-        case AggregateExpression(func, col):
+        case AggregateExpression(func, col, distinct):
             arg = '*' if col is None else (f'{col.table}.{col.column_name}' if col.table else col.column_name)
-            return f'{func.value}({arg})'
+            prefix = 'DISTINCT ' if distinct else ''
+            return f'{func.value}({prefix}{arg})'
         case BinaryExpression(left, op, right):
             ln = resolve_column_name(left)
             rn = resolve_column_name(right)
@@ -252,6 +289,36 @@ def to_bool(value: object) -> bool:
 # ======================================================================
 # Internal helpers
 # ======================================================================
+
+def _eval_in_values(val: object, candidates: Iterable[object], not_in: bool) -> bool | None:
+    """Shared SQL three-valued logic for IN / NOT IN against lists and subqueries."""
+    has_null = False
+    for cand in candidates:
+        cmp_res = _compare(val, cand, ComparisonOp.EQ)
+        if cmp_res is True:
+            return False if not_in else True
+        if cmp_res is None:
+            has_null = True
+    if has_null:
+        return None
+    return True if not_in else False
+
+
+def _tristate_and(lval: bool | None, rval: bool | None) -> bool | None:
+    if lval is False or rval is False:
+        return False
+    if lval is True and rval is True:
+        return True
+    return None
+
+
+def _like_match(value: str, pattern: str) -> bool:
+    regex_parts = [
+        '.*' if ch == '%' else '.' if ch == '_' else re.escape(ch)
+        for ch in pattern
+    ]
+    return re.fullmatch(''.join(regex_parts), value, re.DOTALL) is not None
+
 
 def _build_outer_row(
     row: RowDict,

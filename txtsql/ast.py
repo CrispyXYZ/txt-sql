@@ -108,9 +108,53 @@ class LogicalExpression(Expression):
 
 @dataclass
 class AggregateExpression(Expression):
-    """Aggregate function call: COUNT(*), SUM(col), SUM(t.col)."""
+    """Aggregate function call: COUNT(*), COUNT(DISTINCT col), SUM(col), SUM(t.col)."""
     func: AggFunc
     column: ColumnExpression | None  # None for COUNT(*)
+    distinct: bool = False
+
+
+@dataclass
+class NotExpression(Expression):
+    """Logical negation: NOT expr."""
+    expr: Expression
+
+
+@dataclass
+class InListExpression(Expression):
+    """expr IN (e1, e2, ...) or expr NOT IN (e1, e2, ...)."""
+    expr: Expression
+    items: list[Expression]
+    not_in: bool = False
+
+
+@dataclass
+class BetweenExpression(Expression):
+    """expr [NOT] BETWEEN low AND high."""
+    expr: Expression
+    low: Expression
+    high: Expression
+    negated: bool = False
+
+
+@dataclass
+class LikeExpression(Expression):
+    """expr [NOT] LIKE pattern."""
+    expr: Expression
+    pattern: Expression
+    negated: bool = False
+
+
+@dataclass
+class ScalarSubqueryExpression(Expression):
+    """(SELECT ...) used as a scalar value expression."""
+    subquery: 'SelectStatement | UnionStatement'
+
+
+@dataclass
+class StarExpression(Expression):
+    """* or table.* wildcard in SELECT list."""
+    table: str | None = None
 
 
 @dataclass
@@ -189,12 +233,14 @@ class JoinClause:
 @dataclass(slots=True, frozen=True)
 class DropTable:
     table_name: str
+    if_exists: bool = False
 
 
 @dataclass(slots=True, frozen=True)
 class CreateTable:
     table_name: str
     columns: list[tuple[str, str]]
+    if_not_exists: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -202,6 +248,14 @@ class InsertValues:
     table_name: str
     columns: list[str] | None
     values: list[list[LiteralValue]]
+
+
+@dataclass(slots=True, frozen=True)
+class InsertSelect:
+    """INSERT INTO table [(cols)] SELECT ..."""
+    table_name: str
+    columns: list[str] | None
+    query: 'SelectStatement | UnionStatement'
 
 
 @dataclass(slots=True, frozen=True)
@@ -239,7 +293,7 @@ class UnionStatement:
 @dataclass(slots=True, frozen=True)
 class UpdateStatement:
     table_name: str
-    set_clauses: list[tuple[str, LiteralValue]]  # [(column, value), ...]
+    set_clauses: list[tuple[str, Expression]]  # [(column, expr), ...]
     where_clause: WhereClause | None
 
 
@@ -274,10 +328,16 @@ def contains_aggregate(expr: Expression) -> bool:
             return True
         case BinaryExpression(left, _, right) | ConditionExpression(left, _, right) | LogicalExpression(left, _, right):
             return contains_aggregate(left) or contains_aggregate(right)
-        case NullCheckExpression(inner, _):
+        case NullCheckExpression(inner, _) | NotExpression(inner):
             return contains_aggregate(inner)
         case InExpression(inner, _, _) | AnyAllExpression(inner, _, _, _):
             return contains_aggregate(inner)
+        case InListExpression(inner, items, _):
+            return contains_aggregate(inner) or any(contains_aggregate(item) for item in items)
+        case BetweenExpression(inner, low, high, _):
+            return contains_aggregate(inner) or contains_aggregate(low) or contains_aggregate(high)
+        case LikeExpression(inner, pattern, _):
+            return contains_aggregate(inner) or contains_aggregate(pattern)
         case _:
             return False
 
@@ -291,9 +351,22 @@ def collect_non_agg_columns(expr: Expression) -> list[ColumnExpression]:
             return [expr]
         case BinaryExpression(left, _, right) | ConditionExpression(left, _, right) | LogicalExpression(left, _, right):
             return collect_non_agg_columns(left) + collect_non_agg_columns(right)
-        case NullCheckExpression(inner, _):
+        case NullCheckExpression(inner, _) | NotExpression(inner):
             return collect_non_agg_columns(inner)
         case InExpression(inner, _, _) | AnyAllExpression(inner, _, _, _):
             return collect_non_agg_columns(inner)
+        case InListExpression(inner, items, _):
+            cols = collect_non_agg_columns(inner)
+            for item in items:
+                cols.extend(collect_non_agg_columns(item))
+            return cols
+        case BetweenExpression(inner, low, high, _):
+            return (
+                collect_non_agg_columns(inner)
+                + collect_non_agg_columns(low)
+                + collect_non_agg_columns(high)
+            )
+        case LikeExpression(inner, pattern, _):
+            return collect_non_agg_columns(inner) + collect_non_agg_columns(pattern)
         case _:
             return []
