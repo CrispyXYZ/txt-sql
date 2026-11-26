@@ -21,6 +21,8 @@ SQL string → Lexer → Tokens → Parser → AST → Executor → Storage (TSV
 | `result.py` | Structured `QueryResult` and `StatementKind` |
 | `engine.py` | `Database(data_dir)` session orchestrator & `execute_sql()` |
 | `cli.py` | Interactive REPL with ASCII table output |
+| `gui_controller.py` | Headless GUI controller (script splitting, history, metadata, formatting) |
+| `gui.py` | Tkinter desktop GUI client (`txtsql-gui`) |
 
 ## Requirements
 
@@ -33,8 +35,18 @@ pip install openpyxl
 
 ## Usage
 
+CLI (interactive REPL):
+
 ```bash
-python -m txtsql
+python -m txtsql [--dir ./data]
+# or: txtsql
+```
+
+GUI (Tkinter desktop client):
+
+```bash
+python -m txtsql --gui [--dir ./data]
+# or: txtsql-gui
 ```
 
 Python API (directory-scoped session & structured results):

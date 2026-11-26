@@ -28,6 +28,7 @@ Repository = "https://github.com/CrispyXYZ/txt-sql"
 
 [project.scripts]
 txtsql = "txtsql.cli:run_cli"
+txtsql-gui = "txtsql.gui:run_gui"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

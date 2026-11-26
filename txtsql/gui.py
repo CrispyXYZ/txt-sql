@@ -1,0 +1,993 @@
+"""Tkinter GUI client for TxtSql (Chinese interface)."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import tkinter as tk
+import tkinter.font as tkfont
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from .exceptions import TxtSqlError
+from .gui_controller import (
+    DEMO_TEMPLATES,
+    ExecutionEntry,
+    GuiController,
+    build_create_table_sql,
+    format_cell_display,
+    format_cell_single_line,
+    sort_rows_for_view,
+)
+from .result import QueryResult, StatementKind
+
+
+_SQL_KEYWORDS = (
+    'CREATE', 'DROP', 'TABLE', 'IF', 'NOT', 'EXISTS', 'INSERT', 'INTO', 'VALUES',
+    'SELECT', 'DISTINCT', 'FROM', 'WHERE', 'AND', 'OR', 'IS', 'NULL', 'TRUE', 'FALSE',
+    'IN', 'BETWEEN', 'LIKE', 'ANY', 'ALL', 'UNION', 'JOIN', 'INNER', 'LEFT', 'RIGHT',
+    'FULL', 'OUTER', 'CROSS', 'NATURAL', 'ON', 'USING', 'AS', 'GROUP', 'BY', 'HAVING',
+    'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'UPDATE', 'SET', 'DELETE', 'IMPORT',
+    'OUTFILE', 'SHOW', 'TABLES', 'DESCRIBE', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
+    'STRING', 'NUMBER', 'VARCHAR', 'DECIMAL', 'INT',
+)
+_KW_PATTERN = re.compile(r'\b(' + '|'.join(_SQL_KEYWORDS) + r')\b', re.IGNORECASE)
+_STR_PATTERN = re.compile(r"'(?:''|[^'])*'")
+_NUM_PATTERN = re.compile(r'\b\d+(?:\.\d+)?\b')
+_COMMENT_PATTERN = re.compile(r'--[^\n]*')
+
+
+def _pick_mono_font(root: tk.Misc) -> str:
+    available = set(tkfont.families(root))
+    for candidate in ('JetBrains Mono', 'DejaVu Sans Mono', 'Consolas', 'Liberation Mono', 'Courier New'):
+        if candidate in available:
+            return candidate
+    return 'TkFixedFont'
+
+
+class _TkLogHandler(logging.Handler):
+    """Logging handler forwarding log records into a Tkinter Text widget."""
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._callback = callback
+        self.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s', '%H:%M:%S'))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self._callback(msg, record.levelname)
+        except Exception:
+            pass
+
+
+class CreateTableDialog(tk.Toplevel):
+    """Modal dialog for creating a new table visually."""
+
+    def __init__(self, parent: tk.Misc, on_submit) -> None:
+        super().__init__(parent)
+        self.title('新建表')
+        self.geometry('520x420')
+        self.minsize(460, 360)
+        self.transient(parent)
+        self.grab_set()
+        self._on_submit = on_submit
+        self._row_widgets: list[tuple[ttk.Frame, tk.StringVar, tk.StringVar]] = []
+
+        self._build_ui()
+        self._add_column_row('id', 'NUMBER')
+        self._add_column_row('name', 'STRING')
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill='both', expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill='x', pady=(0, 8))
+        ttk.Label(top, text='表名：').pack(side='left')
+        self.table_name_var = tk.StringVar()
+        name_entry = ttk.Entry(top, textvariable=self.table_name_var, width=26)
+        name_entry.pack(side='left', padx=(4, 12))
+        name_entry.focus_set()
+
+        self.if_not_exists_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text='IF NOT EXISTS', variable=self.if_not_exists_var).pack(side='left')
+
+        header = ttk.Frame(outer)
+        header.pack(fill='x', pady=(4, 4))
+        ttk.Label(header, text='字段定义（至少 1 列）：').pack(side='left')
+        ttk.Button(header, text='+ 添加列', command=self._add_column_row).pack(side='right')
+
+        col_head = ttk.Frame(outer)
+        col_head.pack(fill='x', pady=(2, 2))
+        ttk.Label(col_head, text='列名', width=24).pack(side='left', padx=(4, 6))
+        ttk.Label(col_head, text='数据类型', width=14).pack(side='left')
+
+        list_container = ttk.Frame(outer, relief='solid', borderwidth=1)
+        list_container.pack(fill='both', expand=True, pady=(0, 10))
+        self._canvas = tk.Canvas(list_container, highlightthickness=0, height=200)
+        scrollbar = ttk.Scrollbar(list_container, orient='vertical', command=self._canvas.yview)
+        self._rows_frame = ttk.Frame(self._canvas, padding=4)
+        self._rows_frame.bind(
+            '<Configure>',
+            lambda _e: self._canvas.configure(scrollregion=self._canvas.bbox('all')),
+        )
+        self._canvas.create_window((0, 0), window=self._rows_frame, anchor='nw')
+        self._canvas.configure(yscrollcommand=scrollbar.set)
+        self._canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill='x')
+        ttk.Button(btns, text='取消', command=self.destroy).pack(side='right', padx=(6, 0))
+        ttk.Button(btns, text='确认建表', style='Accent.TButton', command=self._submit).pack(side='right')
+
+    def _add_column_row(self, default_name: str = '', default_type: str = 'STRING') -> None:
+        row_frame = ttk.Frame(self._rows_frame)
+        row_frame.pack(fill='x', pady=2)
+        name_var = tk.StringVar(value=default_name)
+        type_var = tk.StringVar(value=default_type)
+
+        ttk.Entry(row_frame, textvariable=name_var, width=24).pack(side='left', padx=(2, 6))
+        combo = ttk.Combobox(
+            row_frame, textvariable=type_var, values=('STRING', 'NUMBER'), state='readonly', width=12)
+        combo.pack(side='left', padx=(0, 6))
+
+        entry = (row_frame, name_var, type_var)
+        self._row_widgets.append(entry)
+        ttk.Button(row_frame, text='删除', width=6, command=lambda e=entry: self._remove_row(e)).pack(side='left')
+
+    def _remove_row(self, entry) -> None:
+        if len(self._row_widgets) <= 1:
+            messagebox.showwarning('提示', '表至少需要保留 1 个列。', parent=self)
+            return
+        self._row_widgets.remove(entry)
+        entry[0].destroy()
+
+    def _submit(self) -> None:
+        cols = [(n.get(), t.get()) for _, n, t in self._row_widgets]
+        try:
+            sql = build_create_table_sql(
+                self.table_name_var.get(),
+                cols,
+                if_not_exists=self.if_not_exists_var.get(),
+            )
+        except ValueError as exc:
+            messagebox.showerror('输入校验失败', str(exc), parent=self)
+            return
+        self._on_submit(sql)
+        self.destroy()
+
+
+class TxtSqlApp:
+    """Main Tkinter desktop window for TxtSql."""
+
+    def __init__(self, root: tk.Tk, data_dir: str | os.PathLike[str] = '.') -> None:
+        self.root = root
+        self.controller = GuiController(data_dir)
+        self._mono_font = _pick_mono_font(root)
+        self._highlight_job: str | None = None
+        self._sort_state: tuple[str, bool] | None = None
+        self._current_columns: tuple[str, ...] = ()
+        self._log_handler: _TkLogHandler | None = None
+
+        self._configure_window()
+        self._configure_styles()
+        self._build_menu()
+        self._build_toolbar()
+        self._build_main_panes()
+        self._build_statusbar()
+        self._bind_shortcuts()
+        self._attach_logger()
+
+        self.refresh_metadata()
+        self._append_message('欢迎使用 TxtSql 图形客户端，输入 SQL 后按 F5 或 Ctrl+Enter 执行。', 'info')
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    # ------------------------------------------------------------------
+    # Window & Style setup
+    # ------------------------------------------------------------------
+
+    def _configure_window(self) -> None:
+        self.root.geometry('1160x740')
+        self.root.minsize(860, 560)
+        self._update_title()
+
+    def _update_title(self) -> None:
+        self.root.title(f'TxtSql - {self.controller.data_dir}')
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
+        style.configure('TButton', padding=(8, 4))
+        style.configure('Accent.TButton', padding=(10, 4), foreground='#ffffff', background='#2563eb')
+        style.map(
+            'Accent.TButton',
+            background=[('active', '#1d4ed8'), ('pressed', '#1e40af')],
+        )
+        style.configure('Treeview', rowheight=24)
+        style.configure('Treeview.Heading', font=('TkDefaultFont', 9, 'bold'))
+
+    # ------------------------------------------------------------------
+    # Menu & Toolbar
+    # ------------------------------------------------------------------
+
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label='切换数据目录...', accelerator='Ctrl+O', command=self._choose_directory)
+        file_menu.add_separator()
+        file_menu.add_command(label='打开 SQL 脚本...', command=self._open_sql_file)
+        file_menu.add_command(label='保存 SQL 脚本...', accelerator='Ctrl+S', command=self._save_sql_file)
+        file_menu.add_separator()
+        file_menu.add_command(label='导入 Excel (.xlsx)...', command=self._import_excel)
+        file_menu.add_command(label='导出当前结果...', command=self._export_result)
+        file_menu.add_separator()
+        file_menu.add_command(label='退出', accelerator='Ctrl+Q', command=self._on_close)
+        menubar.add_cascade(label='文件', menu=file_menu)
+
+        run_menu = tk.Menu(menubar, tearoff=0)
+        run_menu.add_command(label='运行全部语句', accelerator='F5 / Ctrl+Enter', command=self._run_all)
+        run_menu.add_command(label='运行选中语句', accelerator='Ctrl+Shift+Enter', command=self._run_selected)
+        run_menu.add_separator()
+        run_menu.add_command(label='清空编辑器', accelerator='Ctrl+L', command=self._clear_editor)
+        menubar.add_cascade(label='执行', menu=run_menu)
+
+        demo_menu = tk.Menu(menubar, tearoff=0)
+        for title, sql in DEMO_TEMPLATES.items():
+            demo_menu.add_command(label=title, command=lambda s=sql, t=title: self._load_template(t, s))
+        menubar.add_cascade(label='示例模板', menu=demo_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label='快捷键与 SQL 速查', command=self._show_help)
+        help_menu.add_command(label='关于 TxtSql', command=self._show_about)
+        menubar.add_cascade(label='帮助', menu=help_menu)
+
+        self.root.config(menu=menubar)
+
+    def _build_toolbar(self) -> None:
+        bar = ttk.Frame(self.root, padding=(8, 6))
+        bar.pack(fill='x')
+
+        ttk.Label(bar, text='数据目录：').pack(side='left')
+        self.dir_var = tk.StringVar(value=str(self.controller.data_dir))
+        dir_label = ttk.Entry(bar, textvariable=self.dir_var, state='readonly', width=34)
+        dir_label.pack(side='left', padx=(0, 6))
+
+        ttk.Button(bar, text='切换目录', command=self._choose_directory).pack(side='left', padx=2)
+        ttk.Button(bar, text='刷新', command=self.refresh_metadata).pack(side='left', padx=2)
+
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=8, pady=2)
+
+        ttk.Button(bar, text='▶ 运行 (F5)', style='Accent.TButton', command=self._run_all).pack(side='left', padx=2)
+        ttk.Button(bar, text='运行选中', command=self._run_selected).pack(side='left', padx=2)
+        ttk.Button(bar, text='清空', command=self._clear_editor).pack(side='left', padx=2)
+
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=8, pady=2)
+
+        ttk.Button(bar, text='导入 Excel', command=self._import_excel).pack(side='left', padx=2)
+        ttk.Button(bar, text='导出结果', command=self._export_result).pack(side='left', padx=2)
+
+        ttk.Separator(self.root, orient='horizontal').pack(fill='x')
+
+    # ------------------------------------------------------------------
+    # Main Panes: Left Metadata + Right (Editor / Results)
+    # ------------------------------------------------------------------
+
+    def _build_main_panes(self) -> None:
+        h_pane = ttk.PanedWindow(self.root, orient='horizontal')
+        h_pane.pack(fill='both', expand=True, padx=6, pady=6)
+
+        # Left sidebar
+        left_frame = ttk.Frame(h_pane, padding=4)
+        self._build_metadata_panel(left_frame)
+        h_pane.add(left_frame, weight=1)
+
+        # Right vertical split
+        v_pane = ttk.PanedWindow(h_pane, orient='vertical')
+        editor_frame = ttk.Frame(v_pane, padding=4)
+        self._build_editor_panel(editor_frame)
+        v_pane.add(editor_frame, weight=2)
+
+        bottom_frame = ttk.Frame(v_pane, padding=4)
+        self._build_bottom_notebook(bottom_frame)
+        v_pane.add(bottom_frame, weight=3)
+
+        h_pane.add(v_pane, weight=4)
+
+    def _build_metadata_panel(self, parent: ttk.Frame) -> None:
+        top = ttk.Frame(parent)
+        top.pack(fill='x', pady=(0, 6))
+        ttk.Label(top, text='数据表浏览器', font=('TkDefaultFont', 10, 'bold')).pack(side='left')
+        ttk.Button(top, text='刷新', width=5, command=self.refresh_metadata).pack(side='right', padx=(4, 0))
+        ttk.Button(top, text='+ 新建表', width=8, command=self._open_create_table_dialog).pack(side='right')
+
+        search_row = ttk.Frame(parent)
+        search_row.pack(fill='x', pady=(0, 6))
+        ttk.Label(search_row, text='筛选：').pack(side='left')
+        self.meta_filter_var = tk.StringVar()
+        self.meta_filter_var.trace_add('write', lambda *_: self.refresh_metadata())
+        ttk.Entry(search_row, textvariable=self.meta_filter_var).pack(side='left', fill='x', expand=True)
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill='both', expand=True)
+
+        self.meta_tree = ttk.Treeview(tree_frame, show='tree', selectmode='browse')
+        vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.meta_tree.yview)
+        self.meta_tree.configure(yscrollcommand=vsb.set)
+        self.meta_tree.pack(side='left', fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+
+        self.meta_tree.bind('<Double-1>', self._on_meta_double_click)
+        self.meta_tree.bind('<Button-3>', self._on_meta_right_click)
+
+        self.meta_menu = tk.Menu(self.root, tearoff=0)
+        self.meta_menu.add_command(label='预览前 100 行', command=self._preview_selected_table)
+        self.meta_menu.add_command(label='查看表结构 (DESCRIBE)', command=self._describe_selected_table)
+        self.meta_menu.add_command(label='插入表名到编辑器', command=self._insert_selected_table_name)
+        self.meta_menu.add_separator()
+        self.meta_menu.add_command(label='删除表 (DROP TABLE)', command=self._drop_selected_table)
+
+    def _build_editor_panel(self, parent: ttk.Frame) -> None:
+        header = ttk.Frame(parent)
+        header.pack(fill='x', pady=(0, 4))
+        ttk.Label(header, text='SQL 编辑器', font=('TkDefaultFont', 10, 'bold')).pack(side='left')
+        ttk.Label(header, text='  (支持多条语句按 ; 分隔，F5 / Ctrl+Enter 执行)', foreground='#64748b').pack(side='left')
+
+        ttk.Label(header, text='历史快速回填：').pack(side='right', padx=(8, 2))
+        self.history_combo_var = tk.StringVar()
+        self.history_combo = ttk.Combobox(header, textvariable=self.history_combo_var, state='readonly', width=28)
+        self.history_combo.pack(side='right')
+        self.history_combo.bind('<<ComboboxSelected>>', self._on_history_combo_select)
+
+        body = ttk.Frame(parent, relief='solid', borderwidth=1)
+        body.pack(fill='both', expand=True)
+
+        self.line_numbers = tk.Text(
+            body, width=4, padx=4, takefocus=0, border=0,
+            background='#f1f5f9', foreground='#64748b',
+            state='disabled', font=(self._mono_font, 10),
+        )
+        self.line_numbers.pack(side='left', fill='y')
+
+        self.sql_text = tk.Text(
+            body, wrap='none', undo=True, border=0, padx=6, pady=4,
+            font=(self._mono_font, 11), insertbackground='#0f172a',
+        )
+        ysb = ttk.Scrollbar(body, orient='vertical', command=self._sync_editor_yscroll)
+        xsb = ttk.Scrollbar(parent, orient='horizontal', command=self.sql_text.xview)
+        self.sql_text.configure(yscrollcommand=lambda *args: self._on_editor_yview(ysb, *args), xscrollcommand=xsb.set)
+
+        self.sql_text.pack(side='left', fill='both', expand=True)
+        ysb.pack(side='right', fill='y')
+        xsb.pack(fill='x')
+
+        self.sql_text.tag_configure('kw', foreground='#1d4ed8', font=(self._mono_font, 11, 'bold'))
+        self.sql_text.tag_configure('str', foreground='#15803d')
+        self.sql_text.tag_configure('num', foreground='#b45309')
+        self.sql_text.tag_configure('comment', foreground='#64748b', font=(self._mono_font, 11, 'italic'))
+
+        self.sql_text.bind('<KeyRelease>', self._on_editor_change)
+        self.sql_text.bind('<ButtonRelease-1>', lambda _e: self._update_cursor_pos())
+        self.sql_text.bind('<Tab>', self._insert_tab_spaces)
+        self.sql_text.bind('<Configure>', lambda _e: self._update_line_numbers())
+
+        self._update_line_numbers()
+
+    def _build_bottom_notebook(self, parent: ttk.Frame) -> None:
+        self.notebook = ttk.Notebook(parent)
+        self.notebook.pack(fill='both', expand=True)
+
+        # Tab 1: 查询结果
+        res_tab = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(res_tab, text='查询结果')
+        res_info_row = ttk.Frame(res_tab)
+        res_info_row.pack(fill='x', pady=(0, 4))
+        self.result_summary_var = tk.StringVar(value='尚未执行查询（表格中 <NULL> 表示 NULL，空白表示空字符串）')
+        ttk.Label(res_info_row, textvariable=self.result_summary_var, foreground='#475569').pack(side='left')
+        ttk.Label(res_info_row, text='提示：点击列头排序，双击单元格查看完整内容', foreground='#64748b').pack(side='right')
+
+        res_tree_frame = ttk.Frame(res_tab)
+        res_tree_frame.pack(fill='both', expand=True)
+        self.result_tree = ttk.Treeview(res_tree_frame, show='headings', selectmode='browse')
+        rvsb = ttk.Scrollbar(res_tree_frame, orient='vertical', command=self.result_tree.yview)
+        rhsb = ttk.Scrollbar(res_tab, orient='horizontal', command=self.result_tree.xview)
+        self.result_tree.configure(yscrollcommand=rvsb.set, xscrollcommand=rhsb.set)
+        self.result_tree.pack(side='left', fill='both', expand=True)
+        rvsb.pack(side='right', fill='y')
+        rhsb.pack(fill='x')
+
+        self.result_tree.tag_configure('even', background='#ffffff')
+        self.result_tree.tag_configure('odd', background='#f8fafc')
+        self.result_tree.bind('<Double-1>', self._on_result_double_click)
+        self.result_tree.bind('<Button-3>', self._on_result_right_click)
+
+        self.result_menu = tk.Menu(self.root, tearoff=0)
+        self.result_menu.add_command(label='复制选中行 (制表符分隔)', command=self._copy_selected_row)
+
+        # Tab 2: 执行消息
+        msg_tab = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(msg_tab, text='执行消息')
+        msg_top = ttk.Frame(msg_tab)
+        msg_top.pack(fill='x', pady=(0, 4))
+        ttk.Button(msg_top, text='清空消息', command=self._clear_messages).pack(side='right')
+
+        msg_body = ttk.Frame(msg_tab)
+        msg_body.pack(fill='both', expand=True)
+        self.msg_text = tk.Text(msg_body, state='disabled', wrap='word', font=(self._mono_font, 10))
+        mvsb = ttk.Scrollbar(msg_body, orient='vertical', command=self.msg_text.yview)
+        self.msg_text.configure(yscrollcommand=mvsb.set)
+        self.msg_text.pack(side='left', fill='both', expand=True)
+        mvsb.pack(side='right', fill='y')
+        self.msg_text.tag_configure('ok', foreground='#15803d')
+        self.msg_text.tag_configure('err', foreground='#dc2626')
+        self.msg_text.tag_configure('info', foreground='#334155')
+
+        # Tab 3: 历史记录
+        hist_tab = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(hist_tab, text='历史记录')
+        hist_frame = ttk.Frame(hist_tab)
+        hist_frame.pack(fill='both', expand=True)
+        self.history_tree = ttk.Treeview(
+            hist_frame,
+            columns=('time', 'status', 'elapsed', 'sql'),
+            show='headings',
+            selectmode='browse',
+        )
+        self.history_tree.heading('time', text='时间')
+        self.history_tree.heading('status', text='状态')
+        self.history_tree.heading('elapsed', text='耗时 (ms)')
+        self.history_tree.heading('sql', text='SQL 语句（双击回填）')
+        self.history_tree.column('time', width=80, stretch=False, anchor='center')
+        self.history_tree.column('status', width=70, stretch=False, anchor='center')
+        self.history_tree.column('elapsed', width=90, stretch=False, anchor='e')
+        self.history_tree.column('sql', width=620, stretch=True)
+        hvsb = ttk.Scrollbar(hist_frame, orient='vertical', command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=hvsb.set)
+        self.history_tree.pack(side='left', fill='both', expand=True)
+        hvsb.pack(side='right', fill='y')
+        self.history_tree.bind('<Double-1>', self._on_history_double_click)
+
+        # Tab 4: 系统日志
+        log_tab = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(log_tab, text='系统日志')
+        log_top = ttk.Frame(log_tab)
+        log_top.pack(fill='x', pady=(0, 4))
+        ttk.Label(log_top, text='日志级别：').pack(side='left')
+        self.log_level_var = tk.StringVar(value='INFO')
+        level_box = ttk.Combobox(
+            log_top, textvariable=self.log_level_var, values=('DEBUG', 'INFO', 'WARNING'), state='readonly', width=10)
+        level_box.pack(side='left', padx=(2, 8))
+        level_box.bind('<<ComboboxSelected>>', self._on_log_level_change)
+        ttk.Button(log_top, text='清空日志', command=self._clear_logs).pack(side='right')
+
+        log_body = ttk.Frame(log_tab)
+        log_body.pack(fill='both', expand=True)
+        self.log_text = tk.Text(log_body, state='disabled', wrap='word', font=(self._mono_font, 9))
+        lvsb = ttk.Scrollbar(log_body, orient='vertical', command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=lvsb.set)
+        self.log_text.pack(side='left', fill='both', expand=True)
+        lvsb.pack(side='right', fill='y')
+        self.log_text.tag_configure('ERROR', foreground='#dc2626')
+        self.log_text.tag_configure('WARNING', foreground='#b45309')
+        self.log_text.tag_configure('INFO', foreground='#1e293b')
+        self.log_text.tag_configure('DEBUG', foreground='#64748b')
+
+    def _build_statusbar(self) -> None:
+        ttk.Separator(self.root, orient='horizontal').pack(fill='x')
+        bar = ttk.Frame(self.root, padding=(8, 3))
+        bar.pack(fill='x')
+        self.status_left_var = tk.StringVar(value='就绪')
+        self.status_mid_var = tk.StringVar(value='')
+        self.status_right_var = tk.StringVar(value='行 1, 列 1')
+        ttk.Label(bar, textvariable=self.status_left_var).pack(side='left')
+        ttk.Label(bar, textvariable=self.status_right_var).pack(side='right')
+        ttk.Label(bar, textvariable=self.status_mid_var, foreground='#475569').pack(side='right', padx=(0, 24))
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind('<F5>', lambda _e: self._run_all())
+        self.root.bind('<Control-Return>', lambda _e: self._run_all())
+        self.root.bind('<Control-Shift-Return>', lambda _e: self._run_selected())
+        self.root.bind('<Control-o>', lambda _e: self._choose_directory())
+        self.root.bind('<Control-s>', lambda _e: self._save_sql_file())
+        self.root.bind('<Control-l>', lambda _e: self._clear_editor())
+        self.root.bind('<Control-q>', lambda _e: self._on_close())
+
+    # ------------------------------------------------------------------
+    # Logging integration
+    # ------------------------------------------------------------------
+
+    def _attach_logger(self) -> None:
+        pkg_logger = logging.getLogger('txtsql')
+        pkg_logger.setLevel(logging.INFO)
+        self._log_handler = _TkLogHandler(self._append_log_line)
+        pkg_logger.addHandler(self._log_handler)
+
+    def _on_log_level_change(self, _event=None) -> None:
+        level_name = self.log_level_var.get()
+        logging.getLogger('txtsql').setLevel(getattr(logging, level_name, logging.INFO))
+
+    def _append_log_line(self, message: str, level: str) -> None:
+        if not self.root.winfo_exists():
+            return
+        self.log_text.configure(state='normal')
+        tag = level if level in ('ERROR', 'WARNING', 'INFO', 'DEBUG') else 'INFO'
+        self.log_text.insert('end', message + '\n', tag)
+        self.log_text.see('end')
+        self.log_text.configure(state='disabled')
+
+    def _clear_logs(self) -> None:
+        self.log_text.configure(state='normal')
+        self.log_text.delete('1.0', 'end')
+        self.log_text.configure(state='disabled')
+
+    # ------------------------------------------------------------------
+    # Metadata sidebar actions
+    # ------------------------------------------------------------------
+
+    def refresh_metadata(self) -> None:
+        for item in self.meta_tree.get_children():
+            self.meta_tree.delete(item)
+        metas = self.controller.get_metadata(self.meta_filter_var.get())
+        for meta in metas:
+            table_iid = f'table:{meta.name}'
+            self.meta_tree.insert('', 'end', iid=table_iid, text=f'{meta.name} ({meta.row_count} 行)', open=False)
+            for col_name, col_type in meta.columns:
+                self.meta_tree.insert(table_iid, 'end', iid=f'col:{meta.name}.{col_name}', text=f'{col_name} : {col_type}')
+        total_tables = len(self.controller.db.list_tables())
+        self.status_left_var.set(f'目录: {self.controller.data_dir}  |  共 {total_tables} 张表')
+
+    def _selected_table_name(self) -> str | None:
+        sel = self.meta_tree.selection()
+        if not sel:
+            return None
+        iid = sel[0]
+        if iid.startswith('table:'):
+            return iid.removeprefix('table:')
+        if iid.startswith('col:'):
+            return iid.removeprefix('col:').split('.', 1)[0]
+        return None
+
+    def _on_meta_double_click(self, _event=None) -> None:
+        table = self._selected_table_name()
+        if table:
+            self._preview_table(table)
+
+    def _on_meta_right_click(self, event: tk.Event) -> None:
+        iid = self.meta_tree.identify_row(event.y)
+        if iid:
+            self.meta_tree.selection_set(iid)
+            self.meta_menu.tk_popup(event.x_root, event.y_root)
+
+    def _preview_selected_table(self) -> None:
+        table = self._selected_table_name()
+        if table:
+            self._preview_table(table)
+
+    def _preview_table(self, table_name: str) -> None:
+        sql = f'SELECT * FROM {table_name} LIMIT 100;'
+        self._set_editor_text(sql)
+        self._execute_text(sql)
+
+    def _describe_selected_table(self) -> None:
+        table = self._selected_table_name()
+        if table:
+            sql = f'DESCRIBE {table};'
+            self._set_editor_text(sql)
+            self._execute_text(sql)
+
+    def _insert_selected_table_name(self) -> None:
+        table = self._selected_table_name()
+        if table:
+            self.sql_text.insert('insert', table)
+            self.sql_text.focus_set()
+            self._on_editor_change()
+
+    def _drop_selected_table(self) -> None:
+        table = self._selected_table_name()
+        if not table:
+            return
+        if not messagebox.askyesno('确认删除表', f'确定要永久删除表 "{table}" 及其全部数据吗？', parent=self.root):
+            return
+        self._execute_text(f'DROP TABLE {table};')
+
+    def _open_create_table_dialog(self) -> None:
+        CreateTableDialog(self.root, on_submit=self._execute_generated_ddl)
+
+    def _execute_generated_ddl(self, sql: str) -> None:
+        self._set_editor_text(sql)
+        self._execute_text(sql)
+
+    # ------------------------------------------------------------------
+    # Editor helpers (line numbers & syntax highlight)
+    # ------------------------------------------------------------------
+
+    def _set_editor_text(self, text: str) -> None:
+        self.sql_text.delete('1.0', 'end')
+        self.sql_text.insert('1.0', text)
+        self._update_line_numbers()
+        self._apply_syntax_highlight()
+        self._update_cursor_pos()
+
+    def _clear_editor(self) -> None:
+        self.sql_text.delete('1.0', 'end')
+        self._update_line_numbers()
+        self._update_cursor_pos()
+
+    def _insert_tab_spaces(self, _event=None) -> str:
+        self.sql_text.insert('insert', '    ')
+        self._on_editor_change()
+        return 'break'
+
+    def _sync_editor_yscroll(self, *args) -> None:
+        self.sql_text.yview(*args)
+        self.line_numbers.yview(*args)
+
+    def _on_editor_yview(self, scrollbar: ttk.Scrollbar, *args) -> None:
+        scrollbar.set(*args)
+        self.line_numbers.yview_moveto(args[0])
+
+    def _on_editor_change(self, _event=None) -> None:
+        self._update_line_numbers()
+        self._update_cursor_pos()
+        if self._highlight_job is not None:
+            self.root.after_cancel(self._highlight_job)
+        self._highlight_job = self.root.after(80, self._apply_syntax_highlight)
+
+    def _update_line_numbers(self) -> None:
+        lines = int(self.sql_text.index('end-1c').split('.')[0])
+        content = '\n'.join(str(i) for i in range(1, lines + 1))
+        self.line_numbers.configure(state='normal')
+        self.line_numbers.delete('1.0', 'end')
+        self.line_numbers.insert('1.0', content)
+        self.line_numbers.configure(state='disabled')
+
+    def _update_cursor_pos(self) -> None:
+        pos = self.sql_text.index('insert')
+        line, col = pos.split('.')
+        self.status_right_var.set(f'行 {line}, 列 {int(col) + 1}')
+
+    def _apply_syntax_highlight(self) -> None:
+        self._highlight_job = None
+        text = self.sql_text.get('1.0', 'end-1c')
+        for tag in ('kw', 'str', 'num', 'comment'):
+            self.sql_text.tag_remove(tag, '1.0', 'end')
+
+        for m in _KW_PATTERN.finditer(text):
+            self.sql_text.tag_add('kw', f'1.0+{m.start()}c', f'1.0+{m.end()}c')
+        for m in _NUM_PATTERN.finditer(text):
+            self.sql_text.tag_add('num', f'1.0+{m.start()}c', f'1.0+{m.end()}c')
+        for m in _STR_PATTERN.finditer(text):
+            start, end = f'1.0+{m.start()}c', f'1.0+{m.end()}c'
+            self.sql_text.tag_remove('kw', start, end)
+            self.sql_text.tag_remove('num', start, end)
+            self.sql_text.tag_add('str', start, end)
+        for m in _COMMENT_PATTERN.finditer(text):
+            start, end = f'1.0+{m.start()}c', f'1.0+{m.end()}c'
+            for t in ('kw', 'num', 'str'):
+                self.sql_text.tag_remove(t, start, end)
+            self.sql_text.tag_add('comment', start, end)
+
+    # ------------------------------------------------------------------
+    # SQL execution & Result rendering
+    # ------------------------------------------------------------------
+
+    def _run_all(self) -> None:
+        script = self.sql_text.get('1.0', 'end-1c')
+        self._execute_text(script)
+
+    def _run_selected(self) -> None:
+        try:
+            script = self.sql_text.get('sel.first', 'sel.last')
+        except tk.TclError:
+            messagebox.showinfo('提示', '请先在编辑器中选中要执行的 SQL 语句。', parent=self.root)
+            return
+        self._execute_text(script)
+
+    def _execute_text(self, script: str) -> None:
+        report = self.controller.execute_script(script)
+        if not report.entries:
+            self._append_message('未检测到可执行 SQL 语句。', 'info')
+            return
+
+        for entry in report.entries:
+            self._record_entry_ui(entry)
+
+        if report.schema_changed:
+            self.refresh_metadata()
+
+        if report.last_tabular is not None:
+            self._render_result_table(report.last_tabular)
+            self.notebook.select(0)
+        elif report.error_count > 0:
+            self.notebook.select(1)
+
+        last_entry = report.entries[-1]
+        if last_entry.ok and last_entry.result is not None:
+            self.status_mid_var.set(self._format_entry_summary(last_entry))
+        else:
+            self.status_mid_var.set(f'执行失败 ({last_entry.elapsed_ms:.2f} ms)')
+
+    def _format_entry_summary(self, entry: ExecutionEntry) -> str:
+        res = entry.result
+        assert res is not None
+        if res.is_tabular:
+            return f'{res.kind.value}: 返回 {len(res.rows)} 行 ({entry.elapsed_ms:.2f} ms)'
+        if res.affected_rows is not None:
+            return f'{res.kind.value}: 影响 {res.affected_rows} 行 ({entry.elapsed_ms:.2f} ms)'
+        return f'{res.kind.value}: {res.message} ({entry.elapsed_ms:.2f} ms)'
+
+    def _record_entry_ui(self, entry: ExecutionEntry) -> None:
+        single_line_sql = ' '.join(entry.sql.split())
+        if len(single_line_sql) > 120:
+            single_line_sql = single_line_sql[:117] + '...'
+
+        if entry.ok:
+            summary = self._format_entry_summary(entry)
+            self._append_message(f'[{entry.timestamp}] {summary} | {single_line_sql}', 'ok')
+            status_text = '成功'
+        else:
+            self._append_message(
+                f'[{entry.timestamp}] 错误 ({entry.elapsed_ms:.2f} ms): {entry.error} | {single_line_sql}',
+                'err',
+            )
+            status_text = '失败'
+
+        self.history_tree.insert(
+            '',
+            0,
+            values=(entry.timestamp, status_text, f'{entry.elapsed_ms:.2f}', entry.sql),
+        )
+        recent = [' '.join(h.sql.split())[:80] for h in reversed(self.controller.history[-20:])]
+        self.history_combo['values'] = recent
+
+    def _render_result_table(self, result: QueryResult, sorted_rows: list | None = None) -> None:
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+
+        cols = result.columns
+        self._current_columns = cols
+        rows = sorted_rows if sorted_rows is not None else result.rows
+
+        self.result_tree['columns'] = cols
+        for col in cols:
+            marker = ''
+            if self._sort_state and self._sort_state[0] == col:
+                marker = ' ▼' if self._sort_state[1] else ' ▲'
+            self.result_tree.heading(col, text=f'{col}{marker}', command=lambda c=col: self._sort_by_column(c))
+
+            max_w = max([len(col)] + [len(format_cell_single_line(r.get(col), max_len=40)) for r in rows[:100]])
+            col_px = min(max(max_w * 9 + 24, 80), 320)
+            self.result_tree.column(col, width=col_px, minwidth=60, stretch=False)
+
+        for idx, row in enumerate(rows):
+            vals = [format_cell_single_line(row.get(c)) for c in cols]
+            tag = 'even' if idx % 2 == 0 else 'odd'
+            self.result_tree.insert('', 'end', iid=str(idx), values=vals, tags=(tag,))
+
+        self.result_summary_var.set(f'共 {len(rows)} 行，{len(cols)} 列（<NULL> 表示 NULL，空白表示空字符串）')
+
+    def _sort_by_column(self, col: str) -> None:
+        res = self.controller.last_tabular_result
+        if res is None or not res.rows:
+            return
+        desc = False
+        if self._sort_state and self._sort_state[0] == col:
+            desc = not self._sort_state[1]
+        self._sort_state = (col, desc)
+        sorted_rows = sort_rows_for_view(res.rows, col, descending=desc)
+        self._render_result_table(res, sorted_rows=sorted_rows)
+
+    def _on_result_double_click(self, event: tk.Event) -> None:
+        item_iid = self.result_tree.identify_row(event.y)
+        col_id = self.result_tree.identify_column(event.x)
+        if not item_iid or not col_id or not self._current_columns:
+            return
+        col_idx = int(col_id.removeprefix('#')) - 1
+        if not (0 <= col_idx < len(self._current_columns)):
+            return
+        col_name = self._current_columns[col_idx]
+        res = self.controller.last_tabular_result
+        row_idx = int(item_iid)
+        if res is not None and 0 <= row_idx < len(res.rows) and self._sort_state is None:
+            raw_val = res.rows[row_idx].get(col_name)
+            text = format_cell_display(raw_val)
+        else:
+            values = self.result_tree.item(item_iid, 'values')
+            text = str(values[col_idx]) if col_idx < len(values) else ''
+        self._show_cell_detail_dialog(col_name, text)
+
+    def _show_cell_detail_dialog(self, col_name: str, text: str) -> None:
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f'单元格详情 - {col_name}')
+        dlg.geometry('480x300')
+        dlg.transient(self.root)
+        frame = ttk.Frame(dlg, padding=10)
+        frame.pack(fill='both', expand=True)
+        txt = tk.Text(frame, wrap='word', font=(self._mono_font, 10))
+        txt.insert('1.0', text)
+        txt.configure(state='disabled')
+        txt.pack(fill='both', expand=True, pady=(0, 8))
+        btns = ttk.Frame(frame)
+        btns.pack(fill='x')
+        ttk.Button(btns, text='复制内容', command=lambda: self._copy_to_clipboard(text)).pack(side='left')
+        ttk.Button(btns, text='关闭', command=dlg.destroy).pack(side='right')
+
+    def _on_result_right_click(self, event: tk.Event) -> None:
+        iid = self.result_tree.identify_row(event.y)
+        if iid:
+            self.result_tree.selection_set(iid)
+            self.result_menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy_selected_row(self) -> None:
+        sel = self.result_tree.selection()
+        if not sel:
+            return
+        vals = self.result_tree.item(sel[0], 'values')
+        self._copy_to_clipboard('\t'.join(str(v) for v in vals))
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    # ------------------------------------------------------------------
+    # Messages & History callbacks
+    # ------------------------------------------------------------------
+
+    def _append_message(self, text: str, tag: str = 'info') -> None:
+        self.msg_text.configure(state='normal')
+        self.msg_text.insert('end', text + '\n', tag)
+        self.msg_text.see('end')
+        self.msg_text.configure(state='disabled')
+
+    def _clear_messages(self) -> None:
+        self.msg_text.configure(state='normal')
+        self.msg_text.delete('1.0', 'end')
+        self.msg_text.configure(state='disabled')
+
+    def _on_history_double_click(self, _event=None) -> None:
+        sel = self.history_tree.selection()
+        if not sel:
+            return
+        vals = self.history_tree.item(sel[0], 'values')
+        if len(vals) >= 4:
+            self._set_editor_text(vals[3])
+
+    def _on_history_combo_select(self, _event=None) -> None:
+        idx = self.history_combo.current()
+        recent = list(reversed(self.controller.history[-20:]))
+        if 0 <= idx < len(recent):
+            self._set_editor_text(recent[idx].sql)
+
+    # ------------------------------------------------------------------
+    # File, Directory, Import/Export & Help dialogs
+    # ------------------------------------------------------------------
+
+    def _choose_directory(self) -> None:
+        selected = filedialog.askdirectory(initialdir=str(self.controller.data_dir), title='选择数据目录')
+        if not selected:
+            return
+        new_dir = self.controller.switch_directory(selected)
+        self.dir_var.set(str(new_dir))
+        self._update_title()
+        self._sort_state = None
+        self.refresh_metadata()
+        self._append_message(f'已切换数据目录至: {new_dir}', 'info')
+
+    def _open_sql_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title='打开 SQL 脚本',
+            filetypes=[('SQL 文件', '*.sql'), ('文本文件', '*.txt'), ('所有文件', '*.*')],
+        )
+        if not path:
+            return
+        content = Path(path).read_text(encoding='utf-8')
+        self._set_editor_text(content)
+
+    def _save_sql_file(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title='保存 SQL 脚本',
+            defaultextension='.sql',
+            filetypes=[('SQL 文件', '*.sql'), ('文本文件', '*.txt')],
+        )
+        if not path:
+            return
+        Path(path).write_text(self.sql_text.get('1.0', 'end-1c'), encoding='utf-8')
+        self._append_message(f'SQL 脚本已保存至: {path}', 'info')
+
+    def _import_excel(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title='选择要导入的 Excel 文件',
+            filetypes=[('Excel 工作簿', '*.xlsx')],
+        )
+        if not file_path:
+            return
+        default_name = re.sub(r'[^A-Za-z0-9_]', '_', Path(file_path).stem) or 'imported_table'
+        if not default_name[0].isalpha() and default_name[0] != '_':
+            default_name = f't_{default_name}'
+        table_name = simpledialog.askstring(
+            '导入 Excel',
+            '请输入新建目标表名（首行为列名，自动推断 STRING/NUMBER 类型）：',
+            initialvalue=default_name,
+            parent=self.root,
+        )
+        if not table_name:
+            return
+        try:
+            entry = self.controller.import_excel(table_name, file_path)
+        except (ValueError, TxtSqlError) as exc:
+            messagebox.showerror('导入失败', str(exc), parent=self.root)
+            return
+        self._record_entry_ui(entry)
+        if entry.ok:
+            self.refresh_metadata()
+            self._preview_table(table_name.strip())
+        else:
+            messagebox.showerror('导入失败', entry.error or '未知错误', parent=self.root)
+
+    def _export_result(self) -> None:
+        if self.controller.last_tabular_result is None:
+            messagebox.showinfo('提示', '请先执行一条查询语句后再导出结果。', parent=self.root)
+            return
+        file_path = filedialog.asksaveasfilename(
+            title='导出查询结果',
+            defaultextension='.xlsx',
+            filetypes=[('Excel 工作簿', '*.xlsx'), ('CSV 文件', '*.csv'), ('TSV 文件', '*.tsv')],
+        )
+        if not file_path:
+            return
+        try:
+            count = self.controller.export_last_result(file_path)
+        except Exception as exc:
+            messagebox.showerror('导出失败', str(exc), parent=self.root)
+            return
+        self._append_message(f'成功导出 {count} 行至: {file_path}', 'ok')
+        messagebox.showinfo('导出成功', f'已成功导出 {count} 行记录到:\n{file_path}', parent=self.root)
+
+    def _load_template(self, title: str, sql: str) -> None:
+        self._set_editor_text(sql)
+        self._append_message(f'已加载示例模板：{title}（按 F5 运行）', 'info')
+
+    def _show_help(self) -> None:
+        messagebox.showinfo(
+            '快捷键与 SQL 速查',
+            '快捷键：\n'
+            '  F5 / Ctrl+Enter       运行编辑器全部 SQL\n'
+            '  Ctrl+Shift+Enter      仅运行选中 SQL\n'
+            '  Ctrl+O                切换数据目录\n'
+            '  Ctrl+S                保存 SQL 脚本\n'
+            '  Ctrl+L                清空编辑器\n\n'
+            '支持的 SQL 特性：\n'
+            '  - DDL/DML: CREATE/DROP TABLE [IF (NOT) EXISTS], INSERT VALUES/SELECT, UPDATE SET expr, DELETE\n'
+            '  - 查询: SELECT [DISTINCT], *, table.*, WHERE (3VL/NOT/IN/BETWEEN/LIKE), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET\n'
+            '  - 多表与子查询: INNER/LEFT/RIGHT/FULL/CROSS/NATURAL/USING JOIN, IN/ANY/ALL/EXISTS/标量子查询, UNION [ALL]\n'
+            '  - 扩展: SHOW TABLES, DESCRIBE, IMPORT ... FROM, INTO OUTFILE',
+            parent=self.root,
+        )
+
+    def _show_about(self) -> None:
+        messagebox.showinfo(
+            '关于 TxtSql',
+            'TxtSql — 基于纯文本 TSV 文件的关系型数据库系统\n\n'
+            '• 自主实现词法分析器、递归下降语法分析器与三值逻辑执行引擎\n'
+            '• 支持命令行 (CLI) 与 Tkinter 图形用户界面 (GUI) 双交互模式',
+            parent=self.root,
+        )
+
+    def _on_close(self) -> None:
+        if self._log_handler is not None:
+            logging.getLogger('txtsql').removeHandler(self._log_handler)
+            self._log_handler = None
+        self.root.destroy()
+
+
+def run_gui(data_dir: str | os.PathLike[str] = '.') -> None:
+    """Launch the TxtSql Tkinter desktop GUI."""
+    root = tk.Tk()
+    TxtSqlApp(root, data_dir=data_dir)
+    root.mainloop()
