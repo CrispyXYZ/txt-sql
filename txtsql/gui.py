@@ -8,7 +8,7 @@ import re
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from .exceptions import TxtSqlError
 from .gui_controller import (
@@ -62,14 +62,39 @@ class _TkLogHandler(logging.Handler):
             pass
 
 
+def _configure_dialog(
+    dlg: tk.Toplevel,
+    parent: tk.Misc,
+    base_w: int,
+    base_h: int,
+    min_w: int,
+    min_h: int,
+) -> None:
+    """Size a dialog with HiDPI headroom and center it over its parent window."""
+    dlg.update_idletasks()
+    sw = dlg.winfo_screenwidth()
+    sh = dlg.winfo_screenheight()
+    w = min(int(sw * 0.85), max(base_w, dlg.winfo_reqwidth() + 48))
+    h = min(int(sh * 0.82), max(base_h, dlg.winfo_reqheight() + 40))
+
+    parent.update_idletasks()
+    px = parent.winfo_rootx()
+    py = parent.winfo_rooty()
+    pw = parent.winfo_width() or sw
+    ph = parent.winfo_height() or sh
+    x = max(0, min(sw - w, px + (pw - w) // 2))
+    y = max(0, min(sh - h, py + (ph - h) // 2))
+
+    dlg.geometry(f'{w}x{h}+{x}+{y}')
+    dlg.minsize(min(min_w, w), min(min_h, h))
+
+
 class CreateTableDialog(tk.Toplevel):
     """Modal dialog for creating a new table visually."""
 
     def __init__(self, parent: tk.Misc, on_submit) -> None:
         super().__init__(parent)
         self.title('新建表')
-        self.geometry('620x480')
-        self.minsize(520, 400)
         self.transient(parent)
         self.grab_set()
         self._on_submit = on_submit
@@ -78,61 +103,63 @@ class CreateTableDialog(tk.Toplevel):
         self._build_ui()
         self._add_column_row('id', 'NUMBER')
         self._add_column_row('name', 'STRING')
+        _configure_dialog(self, parent, base_w=780, base_h=580, min_w=640, min_h=480)
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self, padding=12)
+        outer = ttk.Frame(self, padding=16)
         outer.pack(fill='both', expand=True)
 
         top = ttk.Frame(outer)
-        top.pack(fill='x', pady=(0, 8))
+        top.pack(fill='x', pady=(0, 12))
         ttk.Label(top, text='表名：').pack(side='left')
         self.table_name_var = tk.StringVar()
-        name_entry = ttk.Entry(top, textvariable=self.table_name_var, width=26)
-        name_entry.pack(side='left', padx=(4, 12))
+        name_entry = ttk.Entry(top, textvariable=self.table_name_var, width=30)
+        name_entry.pack(side='left', padx=(6, 16))
         name_entry.focus_set()
 
         self.if_not_exists_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(top, text='IF NOT EXISTS', variable=self.if_not_exists_var).pack(side='left')
 
         header = ttk.Frame(outer)
-        header.pack(fill='x', pady=(4, 4))
+        header.pack(fill='x', pady=(4, 8))
         ttk.Label(header, text='字段定义（至少 1 列）：').pack(side='left')
         ttk.Button(header, text='+ 添加列', command=self._add_column_row).pack(side='right')
 
         col_head = ttk.Frame(outer)
-        col_head.pack(fill='x', pady=(2, 2))
-        ttk.Label(col_head, text='列名', width=24).pack(side='left', padx=(4, 6))
-        ttk.Label(col_head, text='数据类型', width=14).pack(side='left')
+        col_head.pack(fill='x', pady=(2, 4))
+        ttk.Label(col_head, text='列名', width=28).pack(side='left', padx=(8, 10))
+        ttk.Label(col_head, text='数据类型', width=16).pack(side='left')
 
         list_container = ttk.Frame(outer, relief='solid', borderwidth=1)
-        list_container.pack(fill='both', expand=True, pady=(0, 10))
-        self._canvas = tk.Canvas(list_container, highlightthickness=0, height=200)
+        list_container.pack(fill='both', expand=True, pady=(0, 14))
+        self._canvas = tk.Canvas(list_container, highlightthickness=0, height=240)
         scrollbar = ttk.Scrollbar(list_container, orient='vertical', command=self._canvas.yview)
-        self._rows_frame = ttk.Frame(self._canvas, padding=4)
+        self._rows_frame = ttk.Frame(self._canvas, padding=8)
         self._rows_frame.bind(
             '<Configure>',
             lambda _e: self._canvas.configure(scrollregion=self._canvas.bbox('all')),
         )
-        self._canvas.create_window((0, 0), window=self._rows_frame, anchor='nw')
+        win_id = self._canvas.create_window((0, 0), window=self._rows_frame, anchor='nw')
+        self._canvas.bind('<Configure>', lambda e: self._canvas.itemconfigure(win_id, width=e.width))
         self._canvas.configure(yscrollcommand=scrollbar.set)
         self._canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
         btns = ttk.Frame(outer)
         btns.pack(fill='x')
-        ttk.Button(btns, text='取消', command=self.destroy).pack(side='right', padx=(6, 0))
+        ttk.Button(btns, text='取消', command=self.destroy).pack(side='right', padx=(8, 0))
         ttk.Button(btns, text='确认建表', style='Accent.TButton', command=self._submit).pack(side='right')
 
     def _add_column_row(self, default_name: str = '', default_type: str = 'STRING') -> None:
         row_frame = ttk.Frame(self._rows_frame)
-        row_frame.pack(fill='x', pady=4)
+        row_frame.pack(fill='x', pady=6)
         name_var = tk.StringVar(value=default_name)
         type_var = tk.StringVar(value=default_type)
 
-        ttk.Entry(row_frame, textvariable=name_var, width=26).pack(side='left', padx=(2, 8))
+        ttk.Entry(row_frame, textvariable=name_var, width=28).pack(side='left', padx=(2, 10))
         combo = ttk.Combobox(
             row_frame, textvariable=type_var, values=('STRING', 'NUMBER'), state='readonly', width=14)
-        combo.pack(side='left', padx=(0, 8))
+        combo.pack(side='left', padx=(0, 10))
 
         entry = (row_frame, name_var, type_var)
         self._row_widgets.append(entry)
@@ -157,6 +184,48 @@ class CreateTableDialog(tk.Toplevel):
             messagebox.showerror('输入校验失败', str(exc), parent=self)
             return
         self._on_submit(sql)
+        self.destroy()
+
+
+class ImportTableDialog(tk.Toplevel):
+    """Modal dialog for specifying target table name when importing an Excel file."""
+
+    def __init__(self, parent: tk.Misc, file_path: str, default_name: str) -> None:
+        super().__init__(parent)
+        self.title('导入 Excel 工作簿')
+        self.transient(parent)
+        self.grab_set()
+        self.result: str | None = None
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill='both', expand=True)
+
+        ttk.Label(outer, text='源文件：').pack(anchor='w')
+        path_var = tk.StringVar(value=file_path)
+        ttk.Entry(outer, textvariable=path_var, state='readonly').pack(fill='x', pady=(4, 12))
+
+        ttk.Label(outer, text='目标表名（首行为列名，自动推断 STRING / NUMBER 类型）：').pack(anchor='w')
+        self._name_var = tk.StringVar(value=default_name)
+        entry = ttk.Entry(outer, textvariable=self._name_var)
+        entry.pack(fill='x', pady=(4, 16))
+        entry.select_range(0, 'end')
+        entry.focus_set()
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill='x')
+        ttk.Button(btns, text='取消', command=self.destroy).pack(side='right', padx=(8, 0))
+        ttk.Button(btns, text='开始导入', style='Accent.TButton', command=self._confirm).pack(side='right')
+
+        self.bind('<Return>', lambda _e: self._confirm())
+        self.bind('<Escape>', lambda _e: self.destroy())
+        _configure_dialog(self, parent, base_w=620, base_h=260, min_w=520, min_h=230)
+
+    def _confirm(self) -> None:
+        name = self._name_var.get().strip()
+        if not name:
+            messagebox.showwarning('提示', '请输入目标表名。', parent=self)
+            return
+        self.result = name
         self.destroy()
 
 
@@ -849,18 +918,28 @@ class TxtSqlApp:
     def _show_cell_detail_dialog(self, col_name: str, text: str) -> None:
         dlg = tk.Toplevel(self.root)
         dlg.title(f'单元格详情 - {col_name}')
-        dlg.geometry('480x300')
         dlg.transient(self.root)
-        frame = ttk.Frame(dlg, padding=10)
+        frame = ttk.Frame(dlg, padding=14)
         frame.pack(fill='both', expand=True)
-        txt = tk.Text(frame, wrap='word', font=(self._mono_font, 10))
+
+        body = ttk.Frame(frame)
+        body.pack(fill='both', expand=True, pady=(0, 12))
+        txt = tk.Text(
+            body, wrap='word', padx=8, pady=6,
+            spacing1=3, spacing3=3, font=(self._mono_font, 11),
+        )
+        vsb = ttk.Scrollbar(body, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
         txt.insert('1.0', text)
         txt.configure(state='disabled')
-        txt.pack(fill='both', expand=True, pady=(0, 8))
+        txt.pack(side='left', fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+
         btns = ttk.Frame(frame)
         btns.pack(fill='x')
-        ttk.Button(btns, text='复制内容', command=lambda: self._copy_to_clipboard(text)).pack(side='left')
+        ttk.Button(btns, text='复制内容', style='Accent.TButton', command=lambda: self._copy_to_clipboard(text)).pack(side='left')
         ttk.Button(btns, text='关闭', command=dlg.destroy).pack(side='right')
+        _configure_dialog(dlg, self.root, base_w=680, base_h=440, min_w=520, min_h=340)
 
     def _on_result_right_click(self, event: tk.Event) -> None:
         iid = self.result_tree.identify_row(event.y)
@@ -954,12 +1033,9 @@ class TxtSqlApp:
         default_name = re.sub(r'[^A-Za-z0-9_]', '_', Path(file_path).stem) or 'imported_table'
         if not default_name[0].isalpha() and default_name[0] != '_':
             default_name = f't_{default_name}'
-        table_name = simpledialog.askstring(
-            '导入 Excel',
-            '请输入新建目标表名（首行为列名，自动推断 STRING/NUMBER 类型）：',
-            initialvalue=default_name,
-            parent=self.root,
-        )
+        dlg = ImportTableDialog(self.root, file_path, default_name)
+        self.root.wait_window(dlg)
+        table_name = dlg.result
         if not table_name:
             return
         try:
@@ -998,30 +1074,83 @@ class TxtSqlApp:
         self._append_message(f'已加载示例模板：{title}（按 F5 运行）', 'info')
 
     def _show_help(self) -> None:
-        messagebox.showinfo(
-            '快捷键与 SQL 速查',
-            '快捷键：\n'
-            '  F5 / Ctrl+Enter       运行编辑器全部 SQL\n'
-            '  Ctrl+Shift+Enter      仅运行选中 SQL\n'
-            '  Ctrl+O                切换数据目录\n'
-            '  Ctrl+S                保存 SQL 脚本\n'
-            '  Ctrl+L                清空编辑器\n\n'
-            '支持的 SQL 特性：\n'
-            '  - DDL/DML: CREATE/DROP TABLE [IF (NOT) EXISTS], INSERT VALUES/SELECT, UPDATE SET expr, DELETE\n'
-            '  - 查询: SELECT [DISTINCT], *, table.*, WHERE (3VL/NOT/IN/BETWEEN/LIKE), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET\n'
-            '  - 多表与子查询: INNER/LEFT/RIGHT/FULL/CROSS/NATURAL/USING JOIN, IN/ANY/ALL/EXISTS/标量子查询, UNION [ALL]\n'
-            '  - 扩展: SHOW TABLES, DESCRIBE, IMPORT ... FROM, INTO OUTFILE',
-            parent=self.root,
+        dlg = tk.Toplevel(self.root)
+        dlg.title('快捷键与 SQL 速查')
+        dlg.transient(self.root)
+        outer = ttk.Frame(dlg, padding=16)
+        outer.pack(fill='both', expand=True)
+
+        body = ttk.Frame(outer)
+        body.pack(fill='both', expand=True, pady=(0, 12))
+        txt = tk.Text(
+            body, wrap='word', padx=10, pady=8,
+            spacing1=3, spacing3=3, font=(self._mono_font, 10),
         )
+        vsb = ttk.Scrollbar(body, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        txt.insert(
+            '1.0',
+            '【快捷键】\n'
+            '  F5 / Ctrl+Enter        运行编辑器全部 SQL 语句\n'
+            '  Ctrl+Shift+Enter       仅运行当前选中的 SQL 语句\n'
+            '  Ctrl+O                 切换数据目录\n'
+            '  Ctrl+S                 保存 SQL 脚本到文件\n'
+            '  Ctrl+L                 清空编辑器内容\n'
+            '  Ctrl+Q                 退出客户端\n\n'
+            '【支持的 SQL 语法】\n'
+            '  • DDL / DML:\n'
+            '      CREATE TABLE [IF NOT EXISTS] tbl (col1 NUMBER, col2 STRING)\n'
+            '      DROP TABLE [IF EXISTS] tbl\n'
+            '      INSERT INTO tbl [(cols)] VALUES (...), (...) | SELECT ...\n'
+            '      UPDATE tbl SET col = expr [WHERE ...]\n'
+            '      DELETE FROM tbl [WHERE ...]\n'
+            '  • 单表与聚合查询:\n'
+            '      SELECT [DISTINCT] *, tbl.*, expr [AS alias]\n'
+            '      WHERE (SQL 三值逻辑: AND / OR / NOT / IS [NOT] NULL / IN / BETWEEN / LIKE)\n'
+            '      GROUP BY / HAVING / COUNT(*) / COUNT(DISTINCT col) / SUM / AVG / MIN / MAX\n'
+            '      ORDER BY col [ASC|DESC] / LIMIT n / OFFSET n\n'
+            '  • 多表连接、子查询与集合运算:\n'
+            '      INNER / LEFT / RIGHT / FULL [OUTER] / CROSS / NATURAL / USING JOIN\n'
+            '      IN / NOT IN / ANY / ALL / EXISTS / NOT EXISTS / 标量子查询 (含关联)\n'
+            '      SELECT ... UNION [ALL] SELECT ...\n'
+            '  • 系统与导入导出:\n'
+            "      SHOW TABLES;  DESCRIBE tbl;  IMPORT tbl FROM 'file.xlsx';  INTO OUTFILE '...'",
+        )
+        txt.configure(state='disabled')
+        txt.pack(side='left', fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill='x')
+        ttk.Button(btns, text='关闭', style='Accent.TButton', command=dlg.destroy).pack(side='right')
+        _configure_dialog(dlg, self.root, base_w=780, base_h=520, min_w=620, min_h=400)
 
     def _show_about(self) -> None:
-        messagebox.showinfo(
-            '关于 TxtSql',
-            'TxtSql — 基于纯文本 TSV 文件的关系型数据库系统\n\n'
-            '• 自主实现词法分析器、递归下降语法分析器与三值逻辑执行引擎\n'
-            '• 支持命令行 (CLI) 与 Tkinter 图形用户界面 (GUI) 双交互模式',
-            parent=self.root,
-        )
+        dlg = tk.Toplevel(self.root)
+        dlg.title('关于 TxtSql')
+        dlg.transient(self.root)
+        outer = ttk.Frame(dlg, padding=18)
+        outer.pack(fill='both', expand=True)
+
+        ttk.Label(
+            outer,
+            text='TxtSql — 基于纯文本 TSV 文件的关系型数据库系统',
+            font=('TkDefaultFont', 12, 'bold'),
+        ).pack(anchor='w', pady=(0, 12))
+        ttk.Label(
+            outer,
+            text=(
+                '• 自主实现词法分析器、递归下降语法分析器与 SQL 三值逻辑执行引擎\n\n'
+                '• 支持单表/多表连接、聚合分组、子查询、集合运算与 Excel/CSV/TSV 导入导出\n\n'
+                '• 提供命令行 (CLI) 与 Tkinter 图形用户界面 (GUI) 双交互模式'
+            ),
+            justify='left',
+        ).pack(anchor='w', fill='x', expand=True)
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill='x', pady=(14, 0))
+        ttk.Button(btns, text='确定', style='Accent.TButton', command=dlg.destroy).pack(side='right')
+        _configure_dialog(dlg, self.root, base_w=600, base_h=280, min_w=480, min_h=240)
 
     def _on_close(self) -> None:
         if self._log_handler is not None:
