@@ -1007,7 +1007,12 @@ class TxtSqlApp:
             self._completion_popup.withdraw()
 
     def _hide_completion_popup_if_unfocused(self) -> None:
-        focus = self.root.focus_get()
+        if not self.root.winfo_exists():
+            return
+        try:
+            focus = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            focus = None
         if focus in (self.sql_text, self._completion_popup, self._completion_listbox):
             return
         self._hide_completion_popup()
