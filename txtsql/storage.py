@@ -65,6 +65,9 @@ def _string_to_data(string: str, type_def: Types) -> DataValue:
         return None
     match type_def:
         case Types.NUMBER:
+            # Backward-compatible with legacy TSV files where empty fields denoted NULL.
+            if string == '':
+                return None
             return Decimal(string)
         case Types.STRING:
             return string.replace('\\\\', '\\')

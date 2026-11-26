@@ -961,6 +961,13 @@ class TestStorageAndTypes:
         execute_sql("INSERT INTO items VALUES (9, 'fresh');")
         assert execute_sql('SELECT * FROM items;') == [{'id': Decimal('9'), 'label': 'fresh'}]
 
+    def test_legacy_empty_number_field_reads_as_null(self, tmp_path):
+        # Legacy TSV files stored NULL as "" in NUMBER columns while STRING "" remains ''
+        (tmp_path / 'metadata.txt').write_text('legacy\t2\tn\tNUMBER\ts\tSTRING\n', encoding='utf-8')
+        (tmp_path / 'legacy.txt').write_text('""\t""\n"42"\t"ok"\n', encoding='utf-8')
+        rows = execute_sql('SELECT * FROM legacy;')
+        assert rows == [{'n': None, 's': ''}, {'n': Decimal('42'), 's': 'ok'}]
+
 
 # ---------------------------------------------------------------------------
 # TRUE / FALSE semantics (= 1 / 0 NUMBER literals, arithmetic allowed)

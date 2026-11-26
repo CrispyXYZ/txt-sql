@@ -68,8 +68,8 @@ class CreateTableDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, on_submit) -> None:
         super().__init__(parent)
         self.title('新建表')
-        self.geometry('520x420')
-        self.minsize(460, 360)
+        self.geometry('620x480')
+        self.minsize(520, 400)
         self.transient(parent)
         self.grab_set()
         self._on_submit = on_submit
@@ -125,18 +125,18 @@ class CreateTableDialog(tk.Toplevel):
 
     def _add_column_row(self, default_name: str = '', default_type: str = 'STRING') -> None:
         row_frame = ttk.Frame(self._rows_frame)
-        row_frame.pack(fill='x', pady=2)
+        row_frame.pack(fill='x', pady=4)
         name_var = tk.StringVar(value=default_name)
         type_var = tk.StringVar(value=default_type)
 
-        ttk.Entry(row_frame, textvariable=name_var, width=24).pack(side='left', padx=(2, 6))
+        ttk.Entry(row_frame, textvariable=name_var, width=26).pack(side='left', padx=(2, 8))
         combo = ttk.Combobox(
-            row_frame, textvariable=type_var, values=('STRING', 'NUMBER'), state='readonly', width=12)
-        combo.pack(side='left', padx=(0, 6))
+            row_frame, textvariable=type_var, values=('STRING', 'NUMBER'), state='readonly', width=14)
+        combo.pack(side='left', padx=(0, 8))
 
         entry = (row_frame, name_var, type_var)
         self._row_widgets.append(entry)
-        ttk.Button(row_frame, text='删除', width=6, command=lambda e=entry: self._remove_row(e)).pack(side='left')
+        ttk.Button(row_frame, text='删除', command=lambda e=entry: self._remove_row(e)).pack(side='left')
 
     def _remove_row(self, entry) -> None:
         if len(self._row_widgets) <= 1:
@@ -182,6 +182,7 @@ class TxtSqlApp:
         self._attach_logger()
 
         self.refresh_metadata()
+        self._finalize_window_geometry()
         self._append_message('欢迎使用 TxtSql 图形客户端，输入 SQL 后按 F5 或 Ctrl+Enter 执行。', 'info')
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
@@ -190,9 +191,28 @@ class TxtSqlApp:
     # ------------------------------------------------------------------
 
     def _configure_window(self) -> None:
-        self.root.geometry('1160x740')
-        self.root.minsize(860, 560)
         self._update_title()
+
+    def _finalize_window_geometry(self) -> None:
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        req_w = self.root.winfo_reqwidth()
+        req_h = self.root.winfo_reqheight()
+        win_w = min(int(sw * 0.90), max(1360, req_w + 80))
+        win_h = min(int(sh * 0.88), max(860, req_h + 60))
+        x = max(0, (sw - win_w) // 2)
+        y = max(0, (sh - win_h) // 2)
+        self.root.geometry(f'{win_w}x{win_h}+{x}+{y}')
+        self.root.minsize(min(1040, win_w), min(680, win_h))
+        self.root.after(50, lambda: self._apply_initial_sashes(win_w, win_h))
+
+    def _apply_initial_sashes(self, win_w: int, win_h: int) -> None:
+        try:
+            self._h_pane.sashpos(0, max(300, int(win_w * 0.24)))
+            self._v_pane.sashpos(0, int(win_h * 0.36))
+        except tk.TclError:
+            pass
 
     def _update_title(self) -> None:
         self.root.title(f'TxtSql - {self.controller.data_dir}')
@@ -203,14 +223,20 @@ class TxtSqlApp:
             style.theme_use('clam')
         except tk.TclError:
             pass
-        style.configure('TButton', padding=(8, 4))
-        style.configure('Accent.TButton', padding=(10, 4), foreground='#ffffff', background='#2563eb')
+        default_font = tkfont.nametofont('TkDefaultFont')
+        line_h = default_font.metrics('linespace') or 20
+        row_h = max(34, int(line_h * 1.65))
+
+        style.configure('TButton', padding=(10, 5))
+        style.configure('Accent.TButton', padding=(12, 5), foreground='#ffffff', background='#2563eb')
         style.map(
             'Accent.TButton',
             background=[('active', '#1d4ed8'), ('pressed', '#1e40af')],
         )
-        style.configure('Treeview', rowheight=24)
-        style.configure('Treeview.Heading', font=('TkDefaultFont', 9, 'bold'))
+        style.configure('TEntry', padding=(4, 3))
+        style.configure('TNotebook.Tab', padding=(12, 6))
+        style.configure('Treeview', rowheight=row_h)
+        style.configure('Treeview.Heading', padding=(8, 6), font=('TkDefaultFont', 9, 'bold'))
 
     # ------------------------------------------------------------------
     # Menu & Toolbar
@@ -251,27 +277,28 @@ class TxtSqlApp:
         self.root.config(menu=menubar)
 
     def _build_toolbar(self) -> None:
-        bar = ttk.Frame(self.root, padding=(8, 6))
-        bar.pack(fill='x')
+        container = ttk.Frame(self.root, padding=(10, 6))
+        container.pack(fill='x')
 
-        ttk.Label(bar, text='数据目录：').pack(side='left')
+        row1 = ttk.Frame(container)
+        row1.pack(fill='x', pady=(0, 6))
+        ttk.Label(row1, text='数据目录：').pack(side='left')
         self.dir_var = tk.StringVar(value=str(self.controller.data_dir))
-        dir_label = ttk.Entry(bar, textvariable=self.dir_var, state='readonly', width=34)
-        dir_label.pack(side='left', padx=(0, 6))
+        dir_label = ttk.Entry(row1, textvariable=self.dir_var, state='readonly')
+        dir_label.pack(side='left', fill='x', expand=True, padx=(4, 8))
+        ttk.Button(row1, text='切换目录', command=self._choose_directory).pack(side='left', padx=2)
+        ttk.Button(row1, text='刷新', command=self.refresh_metadata).pack(side='left', padx=2)
 
-        ttk.Button(bar, text='切换目录', command=self._choose_directory).pack(side='left', padx=2)
-        ttk.Button(bar, text='刷新', command=self.refresh_metadata).pack(side='left', padx=2)
+        row2 = ttk.Frame(container)
+        row2.pack(fill='x')
+        ttk.Button(row2, text='▶ 运行 (F5)', style='Accent.TButton', command=self._run_all).pack(side='left', padx=(0, 4))
+        ttk.Button(row2, text='运行选中', command=self._run_selected).pack(side='left', padx=2)
+        ttk.Button(row2, text='清空', command=self._clear_editor).pack(side='left', padx=2)
 
-        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=8, pady=2)
+        ttk.Separator(row2, orient='vertical').pack(side='left', fill='y', padx=10, pady=2)
 
-        ttk.Button(bar, text='▶ 运行 (F5)', style='Accent.TButton', command=self._run_all).pack(side='left', padx=2)
-        ttk.Button(bar, text='运行选中', command=self._run_selected).pack(side='left', padx=2)
-        ttk.Button(bar, text='清空', command=self._clear_editor).pack(side='left', padx=2)
-
-        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=8, pady=2)
-
-        ttk.Button(bar, text='导入 Excel', command=self._import_excel).pack(side='left', padx=2)
-        ttk.Button(bar, text='导出结果', command=self._export_result).pack(side='left', padx=2)
+        ttk.Button(row2, text='导入 Excel', command=self._import_excel).pack(side='left', padx=2)
+        ttk.Button(row2, text='导出结果', command=self._export_result).pack(side='left', padx=2)
 
         ttk.Separator(self.root, orient='horizontal').pack(fill='x')
 
@@ -281,34 +308,39 @@ class TxtSqlApp:
 
     def _build_main_panes(self) -> None:
         h_pane = ttk.PanedWindow(self.root, orient='horizontal')
-        h_pane.pack(fill='both', expand=True, padx=6, pady=6)
+        h_pane.pack(fill='both', expand=True, padx=8, pady=8)
+        self._h_pane = h_pane
 
         # Left sidebar
-        left_frame = ttk.Frame(h_pane, padding=4)
+        left_frame = ttk.Frame(h_pane, padding=6)
         self._build_metadata_panel(left_frame)
         h_pane.add(left_frame, weight=1)
 
         # Right vertical split
         v_pane = ttk.PanedWindow(h_pane, orient='vertical')
-        editor_frame = ttk.Frame(v_pane, padding=4)
+        self._v_pane = v_pane
+        editor_frame = ttk.Frame(v_pane, padding=6)
         self._build_editor_panel(editor_frame)
         v_pane.add(editor_frame, weight=2)
 
-        bottom_frame = ttk.Frame(v_pane, padding=4)
+        bottom_frame = ttk.Frame(v_pane, padding=6)
         self._build_bottom_notebook(bottom_frame)
         v_pane.add(bottom_frame, weight=3)
 
         h_pane.add(v_pane, weight=4)
 
     def _build_metadata_panel(self, parent: ttk.Frame) -> None:
-        top = ttk.Frame(parent)
-        top.pack(fill='x', pady=(0, 6))
-        ttk.Label(top, text='数据表浏览器', font=('TkDefaultFont', 10, 'bold')).pack(side='left')
-        ttk.Button(top, text='刷新', width=5, command=self.refresh_metadata).pack(side='right', padx=(4, 0))
-        ttk.Button(top, text='+ 新建表', width=8, command=self._open_create_table_dialog).pack(side='right')
+        title_row = ttk.Frame(parent)
+        title_row.pack(fill='x', pady=(0, 6))
+        ttk.Label(title_row, text='数据表浏览器', font=('TkDefaultFont', 10, 'bold')).pack(side='left')
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill='x', pady=(0, 8))
+        ttk.Button(btn_row, text='+ 新建表', command=self._open_create_table_dialog).pack(side='left')
+        ttk.Button(btn_row, text='刷新', command=self.refresh_metadata).pack(side='left', padx=(6, 0))
 
         search_row = ttk.Frame(parent)
-        search_row.pack(fill='x', pady=(0, 6))
+        search_row.pack(fill='x', pady=(0, 8))
         ttk.Label(search_row, text='筛选：').pack(side='left')
         self.meta_filter_var = tk.StringVar()
         self.meta_filter_var.trace_add('write', lambda *_: self.refresh_metadata())
@@ -319,9 +351,11 @@ class TxtSqlApp:
 
         self.meta_tree = ttk.Treeview(tree_frame, show='tree', selectmode='browse')
         vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.meta_tree.yview)
-        self.meta_tree.configure(yscrollcommand=vsb.set)
+        hsb = ttk.Scrollbar(parent, orient='horizontal', command=self.meta_tree.xview)
+        self.meta_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.meta_tree.pack(side='left', fill='both', expand=True)
         vsb.pack(side='right', fill='y')
+        hsb.pack(fill='x')
 
         self.meta_tree.bind('<Double-1>', self._on_meta_double_click)
         self.meta_tree.bind('<Button-3>', self._on_meta_right_click)
@@ -335,28 +369,30 @@ class TxtSqlApp:
 
     def _build_editor_panel(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
-        header.pack(fill='x', pady=(0, 4))
+        header.pack(fill='x', pady=(0, 6))
         ttk.Label(header, text='SQL 编辑器', font=('TkDefaultFont', 10, 'bold')).pack(side='left')
         ttk.Label(header, text='  (支持多条语句按 ; 分隔，F5 / Ctrl+Enter 执行)', foreground='#64748b').pack(side='left')
 
-        ttk.Label(header, text='历史快速回填：').pack(side='right', padx=(8, 2))
         self.history_combo_var = tk.StringVar()
         self.history_combo = ttk.Combobox(header, textvariable=self.history_combo_var, state='readonly', width=28)
         self.history_combo.pack(side='right')
         self.history_combo.bind('<<ComboboxSelected>>', self._on_history_combo_select)
+        ttk.Label(header, text='历史快速回填：').pack(side='right', padx=(8, 4))
 
         body = ttk.Frame(parent, relief='solid', borderwidth=1)
         body.pack(fill='both', expand=True)
 
         self.line_numbers = tk.Text(
-            body, width=4, padx=4, takefocus=0, border=0,
+            body, width=4, padx=6, pady=6, takefocus=0, border=0,
             background='#f1f5f9', foreground='#64748b',
-            state='disabled', font=(self._mono_font, 10),
+            spacing1=3, spacing3=3,
+            state='disabled', font=(self._mono_font, 11),
         )
         self.line_numbers.pack(side='left', fill='y')
 
         self.sql_text = tk.Text(
-            body, wrap='none', undo=True, border=0, padx=6, pady=4,
+            body, wrap='none', undo=True, border=0, padx=8, pady=6,
+            spacing1=3, spacing3=3,
             font=(self._mono_font, 11), insertbackground='#0f172a',
         )
         ysb = ttk.Scrollbar(body, orient='vertical', command=self._sync_editor_yscroll)
@@ -419,7 +455,11 @@ class TxtSqlApp:
 
         msg_body = ttk.Frame(msg_tab)
         msg_body.pack(fill='both', expand=True)
-        self.msg_text = tk.Text(msg_body, state='disabled', wrap='word', font=(self._mono_font, 10))
+        self.msg_text = tk.Text(
+            msg_body, state='disabled', wrap='word',
+            padx=6, pady=6, spacing1=2, spacing3=2,
+            font=(self._mono_font, 10),
+        )
         mvsb = ttk.Scrollbar(msg_body, orient='vertical', command=self.msg_text.yview)
         self.msg_text.configure(yscrollcommand=mvsb.set)
         self.msg_text.pack(side='left', fill='both', expand=True)
@@ -468,7 +508,11 @@ class TxtSqlApp:
 
         log_body = ttk.Frame(log_tab)
         log_body.pack(fill='both', expand=True)
-        self.log_text = tk.Text(log_body, state='disabled', wrap='word', font=(self._mono_font, 9))
+        self.log_text = tk.Text(
+            log_body, state='disabled', wrap='word',
+            padx=6, pady=6, spacing1=2, spacing3=2,
+            font=(self._mono_font, 9),
+        )
         lvsb = ttk.Scrollbar(log_body, orient='vertical', command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=lvsb.set)
         self.log_text.pack(side='left', fill='both', expand=True)
