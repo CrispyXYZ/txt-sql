@@ -13,9 +13,14 @@ from tkinter import filedialog, messagebox, ttk
 from .exceptions import TxtSqlError
 from .gui_controller import (
     DEMO_TEMPLATES,
+    SQL_KEYWORDS,
+    CompletionItem,
+    CompletionResult,
     ExecutionEntry,
     GuiController,
+    StatementSpan,
     build_create_table_sql,
+    find_active_statement,
     format_cell_display,
     format_cell_single_line,
     sort_rows_for_view,
@@ -23,16 +28,7 @@ from .gui_controller import (
 from .result import QueryResult, StatementKind
 
 
-_SQL_KEYWORDS = (
-    'CREATE', 'DROP', 'TABLE', 'IF', 'NOT', 'EXISTS', 'INSERT', 'INTO', 'VALUES',
-    'SELECT', 'DISTINCT', 'FROM', 'WHERE', 'AND', 'OR', 'IS', 'NULL', 'TRUE', 'FALSE',
-    'IN', 'BETWEEN', 'LIKE', 'ANY', 'ALL', 'UNION', 'JOIN', 'INNER', 'LEFT', 'RIGHT',
-    'FULL', 'OUTER', 'CROSS', 'NATURAL', 'ON', 'USING', 'AS', 'GROUP', 'BY', 'HAVING',
-    'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'UPDATE', 'SET', 'DELETE', 'IMPORT',
-    'OUTFILE', 'SHOW', 'TABLES', 'DESCRIBE', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
-    'STRING', 'NUMBER', 'VARCHAR', 'DECIMAL', 'INT',
-)
-_KW_PATTERN = re.compile(r'\b(' + '|'.join(_SQL_KEYWORDS) + r')\b', re.IGNORECASE)
+_KW_PATTERN = re.compile(r'\b(' + '|'.join(SQL_KEYWORDS) + r')\b', re.IGNORECASE)
 _STR_PATTERN = re.compile(r"'(?:''|[^'])*'")
 _NUM_PATTERN = re.compile(r'\b\d+(?:\.\d+)?\b')
 _COMMENT_PATTERN = re.compile(r'--[^\n]*')
@@ -237,6 +233,11 @@ class TxtSqlApp:
         self.controller = GuiController(data_dir)
         self._mono_font = _pick_mono_font(root)
         self._highlight_job: str | None = None
+        self._complete_job: str | None = None
+        self._suppress_space_release: bool = False
+        self._completion_popup: tk.Toplevel | None = None
+        self._completion_listbox: tk.Listbox | None = None
+        self._completion_result: CompletionResult | None = None
         self._sort_state: tuple[str, bool] | None = None
         self._current_columns: tuple[str, ...] = ()
         self._displayed_rows: list = []
@@ -330,9 +331,11 @@ class TxtSqlApp:
         menubar.add_cascade(label='文件', menu=file_menu)
 
         run_menu = tk.Menu(menubar, tearoff=0)
-        run_menu.add_command(label='运行全部语句', accelerator='F5 / Ctrl+Enter', command=self._run_all)
+        run_menu.add_command(label='运行当前语句', accelerator='Ctrl+Enter', command=self._run_current_statement)
+        run_menu.add_command(label='运行全部语句', accelerator='F5', command=self._run_all)
         run_menu.add_command(label='运行选中语句', accelerator='Ctrl+Shift+Enter', command=self._run_selected)
         run_menu.add_separator()
+        run_menu.add_command(label='触发代码补全', accelerator='Ctrl+Space', command=lambda: self._trigger_completions(manual=True))
         run_menu.add_command(label='清空编辑器', accelerator='Ctrl+L', command=self._clear_editor)
         menubar.add_cascade(label='执行', menu=run_menu)
 
@@ -363,7 +366,8 @@ class TxtSqlApp:
 
         row2 = ttk.Frame(container)
         row2.pack(fill='x')
-        ttk.Button(row2, text='▶ 运行 (F5)', style='Accent.TButton', command=self._run_all).pack(side='left', padx=(0, 4))
+        ttk.Button(row2, text='▶ 运行当前 (Ctrl+Enter)', style='Accent.TButton', command=self._run_current_statement).pack(side='left', padx=(0, 4))
+        ttk.Button(row2, text='运行全部 (F5)', command=self._run_all).pack(side='left', padx=2)
         ttk.Button(row2, text='运行选中', command=self._run_selected).pack(side='left', padx=2)
         ttk.Button(row2, text='清空', command=self._clear_editor).pack(side='left', padx=2)
 
@@ -443,7 +447,7 @@ class TxtSqlApp:
         header = ttk.Frame(parent)
         header.pack(fill='x', pady=(0, 6))
         ttk.Label(header, text='SQL 编辑器', font=('TkDefaultFont', 10, 'bold')).pack(side='left')
-        ttk.Label(header, text='  (支持多条语句按 ; 分隔，F5 / Ctrl+Enter 执行)', foreground='#64748b').pack(side='left')
+        ttk.Label(header, text='  (蓝底高亮当前语句: Ctrl+Enter 运行当前 / F5 运行全部 / Ctrl+Space 补全)', foreground='#64748b').pack(side='left')
 
         self.history_combo_var = tk.StringVar()
         self.history_combo = ttk.Combobox(header, textvariable=self.history_combo_var, state='readonly', width=28)
@@ -460,6 +464,10 @@ class TxtSqlApp:
             spacing1=3, spacing3=3,
             state='disabled', font=(self._mono_font, 11),
         )
+        self.line_numbers.tag_configure(
+            'active_line', background='#dbeafe', foreground='#1d4ed8',
+            font=(self._mono_font, 11, 'bold'),
+        )
         self.line_numbers.pack(side='left', fill='y')
 
         self.sql_text = tk.Text(
@@ -475,14 +483,28 @@ class TxtSqlApp:
         ysb.pack(side='right', fill='y')
         xsb.pack(fill='x')
 
+        self.sql_text.tag_configure('active_stmt', background='#eaf3ff')
         self.sql_text.tag_configure('kw', foreground='#1d4ed8', font=(self._mono_font, 11, 'bold'))
         self.sql_text.tag_configure('str', foreground='#15803d')
         self.sql_text.tag_configure('num', foreground='#b45309')
         self.sql_text.tag_configure('comment', foreground='#64748b', font=(self._mono_font, 11, 'italic'))
+        self.sql_text.tag_lower('active_stmt')
 
-        self.sql_text.bind('<KeyRelease>', self._on_editor_change)
-        self.sql_text.bind('<ButtonRelease-1>', lambda _e: self._update_cursor_pos())
-        self.sql_text.bind('<Tab>', self._insert_tab_spaces)
+        self.sql_text.bind('<KeyRelease>', self._on_editor_key_release)
+        self.sql_text.bind('<Control-space>', lambda _e: self._on_ctrl_space())
+        self.sql_text.bind('<Control-Return>', lambda _e: self._on_ctrl_return())
+        self.sql_text.bind('<Control-Shift-Return>', lambda _e: self._on_ctrl_shift_return())
+        self.sql_text.bind('<Up>', lambda _e: self._on_popup_nav(-1))
+        self.sql_text.bind('<Down>', lambda _e: self._on_popup_nav(1))
+        self.sql_text.bind('<Return>', lambda _e: self._on_popup_accept())
+        self.sql_text.bind('<Tab>', lambda _e: self._on_editor_tab())
+        self.sql_text.bind('<Escape>', lambda _e: self._on_popup_escape())
+        self.sql_text.bind('<ButtonRelease-1>', self._on_editor_click)
+        self.sql_text.bind('<FocusIn>', lambda _e: self._update_active_statement_highlight())
+        self.sql_text.bind('<FocusOut>', lambda _e: self.root.after(120, self._hide_completion_popup_if_unfocused))
+        self.sql_text.bind('<MouseWheel>', lambda _e: self._hide_completion_popup())
+        self.sql_text.bind('<Button-4>', lambda _e: self._hide_completion_popup())
+        self.sql_text.bind('<Button-5>', lambda _e: self._hide_completion_popup())
         self.sql_text.bind('<Configure>', lambda _e: self._update_line_numbers())
 
         self._update_line_numbers()
@@ -607,12 +629,17 @@ class TxtSqlApp:
 
     def _bind_shortcuts(self) -> None:
         self.root.bind('<F5>', lambda _e: self._run_all())
-        self.root.bind('<Control-Return>', lambda _e: self._run_all())
-        self.root.bind('<Control-Shift-Return>', lambda _e: self._run_selected())
+        self.root.bind('<Control-Return>', lambda _e: self._on_ctrl_return())
+        self.root.bind('<Control-Shift-Return>', lambda _e: self._on_ctrl_shift_return())
         self.root.bind('<Control-o>', lambda _e: self._choose_directory())
         self.root.bind('<Control-s>', lambda _e: self._save_sql_file())
         self.root.bind('<Control-l>', lambda _e: self._clear_editor())
         self.root.bind('<Control-q>', lambda _e: self._on_close())
+        self.root.bind('<Configure>', self._on_root_configure)
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is self.root:
+            self._hide_completion_popup()
 
     # ------------------------------------------------------------------
     # Logging integration
@@ -720,10 +747,19 @@ class TxtSqlApp:
         self._execute_text(sql)
 
     # ------------------------------------------------------------------
-    # Editor helpers (line numbers & syntax highlight)
+    # Editor helpers (line numbers, syntax highlight, active stmt & completion)
     # ------------------------------------------------------------------
 
+    _IGNORE_COMPLETE_KEYSYMS = frozenset({
+        'Up', 'Down', 'Left', 'Right', 'Home', 'End', 'Prior', 'Next',
+        'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 'Alt_L', 'Alt_R',
+        'Meta_L', 'Meta_R', 'Super_L', 'Super_R', 'Caps_Lock', 'Num_Lock',
+        'Escape', 'Tab', 'Return', 'KP_Enter', 'F1', 'F2', 'F3', 'F4', 'F5',
+        'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12',
+    })
+
     def _set_editor_text(self, text: str) -> None:
+        self._hide_completion_popup()
         self.sql_text.delete('1.0', 'end')
         self.sql_text.insert('1.0', text)
         self._update_line_numbers()
@@ -731,6 +767,7 @@ class TxtSqlApp:
         self._update_cursor_pos()
 
     def _clear_editor(self) -> None:
+        self._hide_completion_popup()
         self.sql_text.delete('1.0', 'end')
         self._update_line_numbers()
         self._update_cursor_pos()
@@ -741,6 +778,7 @@ class TxtSqlApp:
         return 'break'
 
     def _sync_editor_yscroll(self, *args) -> None:
+        self._hide_completion_popup()
         self.sql_text.yview(*args)
         self.line_numbers.yview(*args)
 
@@ -755,6 +793,71 @@ class TxtSqlApp:
             self.root.after_cancel(self._highlight_job)
         self._highlight_job = self.root.after(80, self._apply_syntax_highlight)
 
+    def _on_editor_key_release(self, event: tk.Event) -> None:
+        if self._suppress_space_release and event.keysym == 'space':
+            self._suppress_space_release = False
+            self._update_cursor_pos()
+            return
+        self._suppress_space_release = False
+        self._on_editor_change()
+        if event.keysym in ('Left', 'Right', 'Home', 'End', 'Prior', 'Next'):
+            self._hide_completion_popup()
+            return
+        if event.keysym in self._IGNORE_COMPLETE_KEYSYMS:
+            return
+        if event.state & 0x4:
+            self._hide_completion_popup()
+            return
+        if self._complete_job is not None:
+            self.root.after_cancel(self._complete_job)
+        self._complete_job = self.root.after(60, lambda: self._trigger_completions(manual=False))
+
+    def _on_editor_click(self, _event=None) -> None:
+        self._hide_completion_popup()
+        self._update_cursor_pos()
+
+    def _on_ctrl_space(self) -> str:
+        self._suppress_space_release = True
+        if self._complete_job is not None:
+            self.root.after_cancel(self._complete_job)
+            self._complete_job = None
+        self._trigger_completions(manual=True)
+        return 'break'
+
+    def _on_ctrl_return(self) -> str:
+        self._hide_completion_popup()
+        self._run_current_statement()
+        return 'break'
+
+    def _on_ctrl_shift_return(self) -> str:
+        self._hide_completion_popup()
+        self._run_selected()
+        return 'break'
+
+    def _on_popup_nav(self, delta: int) -> str | None:
+        if not self._is_completion_visible():
+            return None
+        self._move_completion(delta)
+        return 'break'
+
+    def _on_popup_accept(self) -> str | None:
+        if not self._is_completion_visible():
+            return None
+        self._accept_completion()
+        return 'break'
+
+    def _on_editor_tab(self) -> str:
+        if self._is_completion_visible():
+            self._accept_completion()
+            return 'break'
+        return self._insert_tab_spaces()
+
+    def _on_popup_escape(self) -> str | None:
+        if not self._is_completion_visible():
+            return None
+        self._hide_completion_popup()
+        return 'break'
+
     def _update_line_numbers(self) -> None:
         lines = int(self.sql_text.index('end-1c').split('.')[0])
         content = '\n'.join(str(i) for i in range(1, lines + 1))
@@ -762,11 +865,203 @@ class TxtSqlApp:
         self.line_numbers.delete('1.0', 'end')
         self.line_numbers.insert('1.0', content)
         self.line_numbers.configure(state='disabled')
+        self._update_active_statement_highlight()
 
     def _update_cursor_pos(self) -> None:
         pos = self.sql_text.index('insert')
         line, col = pos.split('.')
         self.status_right_var.set(f'行 {line}, 列 {int(col) + 1}')
+        self._update_active_statement_highlight()
+
+    def _get_active_statement(self) -> StatementSpan | None:
+        text = self.sql_text.get('1.0', 'end-1c')
+        cursor_offset = len(self.sql_text.get('1.0', 'insert'))
+        return find_active_statement(text, cursor_offset)
+
+    def _update_active_statement_highlight(self) -> None:
+        self.sql_text.tag_remove('active_stmt', '1.0', 'end')
+        self.line_numbers.tag_remove('active_line', '1.0', 'end')
+
+        text = self.sql_text.get('1.0', 'end-1c')
+        cursor_offset = len(self.sql_text.get('1.0', 'insert'))
+        span = find_active_statement(text, cursor_offset)
+        if span is None:
+            return
+
+        start_line = text.count('\n', 0, span.start) + 1
+        end_line = text.count('\n', 0, max(span.start, span.end - 1)) + 1
+        start_idx = f'{start_line}.0'
+        end_idx = f'{end_line + 1}.0'
+        self.sql_text.tag_add('active_stmt', start_idx, end_idx)
+        self.sql_text.tag_lower('active_stmt')
+        self.line_numbers.tag_add('active_line', start_idx, end_idx)
+
+    def _is_completion_visible(self) -> bool:
+        return (
+            self._completion_popup is not None
+            and self._completion_popup.winfo_exists()
+            and self._completion_popup.winfo_viewable() == 1
+        )
+
+    def _trigger_completions(self, manual: bool = False) -> None:
+        self._complete_job = None
+        if not self.sql_text.winfo_exists():
+            return
+        script = self.sql_text.get('1.0', 'end-1c')
+        cursor_offset = len(self.sql_text.get('1.0', 'insert'))
+        result = self.controller.get_completions(script, cursor_offset, manual=manual)
+        if result is None or not result.items:
+            self._hide_completion_popup()
+            return
+        self._show_completion_popup(result)
+
+    def _format_completion_item(self, item: CompletionItem) -> str:
+        kind_tag = {
+            'column': '[列]',
+            'table': '[表]',
+            'function': '[函数]',
+            'keyword': '[词]',
+        }.get(item.kind, '[ ]')
+        if item.detail:
+            return f' {kind_tag:<4} {item.label:<20} {item.detail}'
+        return f' {kind_tag:<4} {item.label}'
+
+    def _show_completion_popup(self, result: CompletionResult) -> None:
+        bbox = self.sql_text.bbox('insert')
+        if bbox is None:
+            self.sql_text.see('insert')
+            bbox = self.sql_text.bbox('insert')
+            if bbox is None:
+                self._hide_completion_popup()
+                return
+
+        if self._completion_popup is None or not self._completion_popup.winfo_exists():
+            popup = tk.Toplevel(self.root)
+            popup.overrideredirect(True)
+            popup.configure(background='#94a3b8')
+            frame = tk.Frame(popup, background='#ffffff', borderwidth=0)
+            frame.pack(fill='both', expand=True, padx=1, pady=1)
+            lb = tk.Listbox(
+                frame,
+                activestyle='none',
+                background='#ffffff',
+                foreground='#0f172a',
+                selectbackground='#dbeafe',
+                selectforeground='#1e3a8a',
+                borderwidth=0,
+                highlightthickness=0,
+                exportselection=False,
+                takefocus=0,
+                font=(self._mono_font, 10),
+            )
+            lb.pack(fill='both', expand=True)
+            lb.bind('<Button-1>', self._on_listbox_click)
+            lb.bind('<ButtonRelease-1>', self._on_listbox_release)
+            self._completion_popup = popup
+            self._completion_listbox = lb
+
+        assert self._completion_popup is not None and self._completion_listbox is not None
+        self._completion_result = result
+
+        lb = self._completion_listbox
+        lb.delete(0, 'end')
+        max_len = 28
+        for item in result.items:
+            line = self._format_completion_item(item)
+            max_len = max(max_len, len(line) + 2)
+            lb.insert('end', line)
+
+        visible_rows = min(len(result.items), 10)
+        lb.configure(height=visible_rows, width=min(max_len, 62))
+        lb.selection_clear(0, 'end')
+        lb.selection_set(0)
+        lb.activate(0)
+
+        self._completion_popup.update_idletasks()
+        popup_w = self._completion_popup.winfo_reqwidth()
+        popup_h = self._completion_popup.winfo_reqheight()
+
+        rx = self.sql_text.winfo_rootx() + bbox[0]
+        ry_below = self.sql_text.winfo_rooty() + bbox[1] + bbox[3] + 2
+        ry_above = self.sql_text.winfo_rooty() + bbox[1] - popup_h - 2
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        if rx + popup_w > screen_w - 8:
+            rx = max(4, screen_w - popup_w - 8)
+        if ry_below + popup_h > screen_h - 24 and ry_above >= 4:
+            ry = ry_above
+        else:
+            ry = ry_below
+
+        self._completion_popup.geometry(f'+{rx}+{ry}')
+        self._completion_popup.deiconify()
+        self._completion_popup.lift()
+
+    def _hide_completion_popup(self) -> None:
+        if self._complete_job is not None:
+            self.root.after_cancel(self._complete_job)
+            self._complete_job = None
+        self._completion_result = None
+        if self._completion_popup is not None and self._completion_popup.winfo_exists():
+            self._completion_popup.withdraw()
+
+    def _hide_completion_popup_if_unfocused(self) -> None:
+        focus = self.root.focus_get()
+        if focus in (self.sql_text, self._completion_popup, self._completion_listbox):
+            return
+        self._hide_completion_popup()
+
+    def _move_completion(self, delta: int) -> None:
+        if self._completion_listbox is None:
+            return
+        total = self._completion_listbox.size()
+        if total == 0:
+            return
+        sel = self._completion_listbox.curselection()
+        idx = sel[0] if sel else 0
+        nxt = max(0, min(total - 1, idx + delta))
+        self._completion_listbox.selection_clear(0, 'end')
+        self._completion_listbox.selection_set(nxt)
+        self._completion_listbox.activate(nxt)
+        self._completion_listbox.see(nxt)
+
+    def _on_listbox_click(self, event: tk.Event) -> str:
+        if self._completion_listbox is not None:
+            idx = self._completion_listbox.nearest(event.y)
+            self._completion_listbox.selection_clear(0, 'end')
+            self._completion_listbox.selection_set(idx)
+            self._completion_listbox.activate(idx)
+        return 'break'
+
+    def _on_listbox_release(self, event: tk.Event) -> str:
+        if self._completion_listbox is not None:
+            idx = self._completion_listbox.nearest(event.y)
+            self._completion_listbox.selection_clear(0, 'end')
+            self._completion_listbox.selection_set(idx)
+            self._completion_listbox.activate(idx)
+        self._accept_completion()
+        return 'break'
+
+    def _accept_completion(self) -> None:
+        result = self._completion_result
+        lb = self._completion_listbox
+        if result is None or lb is None or not result.items:
+            self._hide_completion_popup()
+            return
+        sel = lb.curselection()
+        idx = sel[0] if sel else 0
+        if idx < 0 or idx >= len(result.items):
+            idx = 0
+        item = result.items[idx]
+        start_idx = f'1.0+{result.replace_start}c'
+        end_idx = f'1.0+{result.replace_end}c'
+        self._hide_completion_popup()
+        self.sql_text.delete(start_idx, end_idx)
+        self.sql_text.insert(start_idx, item.insert_text)
+        self.sql_text.mark_set('insert', f'1.0+{result.replace_start + len(item.insert_text)}c')
+        self.sql_text.focus_set()
+        self._on_editor_change()
 
     def _apply_syntax_highlight(self) -> None:
         self._highlight_job = None
@@ -793,6 +1088,14 @@ class TxtSqlApp:
     # SQL execution & Result rendering
     # ------------------------------------------------------------------
 
+    def _run_current_statement(self) -> None:
+        span = self._get_active_statement()
+        if span is None:
+            self._append_message('当前光标所在位置没有可执行的 SQL 语句（可按 F5 运行全部）。', 'info')
+            self.notebook.select(1)
+            return
+        self._execute_text(span.sql)
+
     def _run_all(self) -> None:
         script = self.sql_text.get('1.0', 'end-1c')
         self._execute_text(script)
@@ -806,6 +1109,7 @@ class TxtSqlApp:
         self._execute_text(script)
 
     def _execute_text(self, script: str) -> None:
+        self._hide_completion_popup()
         report = self.controller.execute_script(script)
         if not report.entries:
             self._append_message('未检测到可执行 SQL 语句。', 'info')
@@ -1015,6 +1319,7 @@ class TxtSqlApp:
     # ------------------------------------------------------------------
 
     def _choose_directory(self) -> None:
+        self._hide_completion_popup()
         selected = filedialog.askdirectory(initialdir=str(self.controller.data_dir), title='选择数据目录')
         if not selected:
             return
@@ -1094,7 +1399,7 @@ class TxtSqlApp:
 
     def _load_template(self, title: str, sql: str) -> None:
         self._set_editor_text(sql)
-        self._append_message(f'已加载示例模板：{title}（按 F5 运行）', 'info')
+        self._append_message(f'已加载示例模板：{title}（Ctrl+Enter 运行当前 / F5 运行全部）', 'info')
 
     def _show_help(self) -> None:
         dlg = tk.Toplevel(self.root)
@@ -1114,8 +1419,11 @@ class TxtSqlApp:
         txt.insert(
             '1.0',
             '【快捷键】\n'
-            '  F5 / Ctrl+Enter        运行编辑器全部 SQL 语句\n'
+            '  Ctrl+Enter             运行光标所在当前高亮 SQL 语句\n'
+            '  F5                     运行编辑器全部 SQL 语句\n'
             '  Ctrl+Shift+Enter       仅运行当前选中的 SQL 语句\n'
+            '  Ctrl+Space             手动弹出 SQL 代码补全列表\n'
+            '  Tab / Enter / ↑↓ / Esc 补全弹窗确认、上下选择或关闭\n'
             '  Ctrl+O                 切换数据目录\n'
             '  Ctrl+S                 保存 SQL 脚本到文件\n'
             '  Ctrl+L                 清空编辑器内容\n'

@@ -13,6 +13,8 @@ from txtsql.gui_controller import (
     NULL_DISPLAY,
     GuiController,
     build_create_table_sql,
+    find_active_statement,
+    find_statement_spans,
     format_cell_display,
     format_cell_single_line,
     sort_rows_for_view,
@@ -171,3 +173,107 @@ class TestGuiController:
         )
         assert '--gui' in proc.stdout
         assert '--dir' in proc.stdout
+
+
+class TestActiveStatementAndCompletion:
+    def test_find_statement_spans_and_active_statement(self):
+        script = (
+            "-- leading comment\n"
+            "SELECT *\n"
+            "FROM weather\n"
+            "WHERE temp_lo > 0;\n"
+            "\n"
+            "SELECT * FROM cities;"
+        )
+        spans = find_statement_spans(script)
+        assert len(spans) == 2
+        assert spans[0].sql == "SELECT *\nFROM weather\nWHERE temp_lo > 0"
+        assert script[spans[0].start:spans[0].end].endswith(';')
+        assert not script[spans[0].start:spans[0].end].startswith('--')
+        assert spans[1].sql == "SELECT * FROM cities"
+
+        # Cursor inside leading comment line -> None
+        assert find_active_statement(script, 5) is None
+        # Cursor inside first multi-line statement -> span 0
+        pos_from = script.index('FROM weather')
+        assert find_active_statement(script, pos_from) == spans[0]
+        # Cursor right after semicolon of first statement -> span 0
+        assert find_active_statement(script, spans[0].end) == spans[0]
+        # Cursor on blank line between statements -> None
+        blank_offset = script.index('\n\n') + 1
+        assert find_active_statement(script, blank_offset) is None
+        # Cursor on second statement -> span 1
+        pos_cities = script.index('cities')
+        assert find_active_statement(script, pos_cities) == spans[1]
+
+    def test_find_active_statement_unterminated_and_same_line(self):
+        script = "SELECT 1;   SELECT 2"
+        spans = find_statement_spans(script)
+        assert len(spans) == 2
+        assert find_active_statement(script, 0) == spans[0]
+        assert find_active_statement(script, len(script)) == spans[1]
+        # Between two statements on same line picks preceding one
+        assert find_active_statement(script, 10) == spans[0]
+
+    def test_completions_table_alias_and_column_priority(self, tmp_path):
+        ctrl = GuiController(tmp_path)
+        ctrl.execute_script(
+            "CREATE TABLE emp (id NUMBER, name STRING, dept_id NUMBER);\n"
+            "CREATE TABLE dept (id NUMBER, title STRING);\n"
+        )
+
+        # 1. Table context after FROM
+        s1 = "SELECT * FROM e"
+        r1 = ctrl.get_completions(s1, len(s1))
+        assert r1 is not None
+        assert r1.prefix == 'e'
+        assert [it.label for it in r1.items] == ['emp']
+        assert r1.items[0].kind == 'table'
+
+        # 2. Qualified alias dot completion before FROM
+        s2 = "SELECT e. FROM emp e JOIN dept d ON e.dept_id = d.id"
+        dot_pos = s2.index('e.') + 2
+        r2 = ctrl.get_completions(s2, dot_pos)
+        assert r2 is not None
+        assert r2.prefix == ''
+        assert [it.label for it in r2.items] == ['id', 'name', 'dept_id']
+
+        # 3. Qualified prefix completion on table name
+        s3 = "SELECT * FROM dept WHERE dept.ti"
+        r3 = ctrl.get_completions(s3, len(s3))
+        assert r3 is not None
+        assert r3.prefix == 'ti'
+        assert [it.label for it in r3.items] == ['title']
+
+        # 4. General completion prioritizes active table columns ahead of keywords/other tables
+        s4 = "SELECT d FROM dept"
+        pos_d = s4.index('d ') + 1
+        r4 = ctrl.get_completions(s4, pos_d)
+        # Active table is dept, wait - 'dept' columns are id/title, not starting with 'd',
+        # so keyword DISTINCT / table dept / other column dept_id appear.
+        assert r4 is not None
+        labels4 = [it.label for it in r4.items]
+        assert 'DISTINCT' in labels4 and 'dept' in labels4
+
+        s5 = "SELECT n FROM emp"
+        pos_n = s5.index('n ') + 1
+        r5 = ctrl.get_completions(s5, pos_n)
+        assert r5 is not None
+        assert r5.items[0].label == 'name'
+        assert r5.items[0].kind == 'column'
+
+    def test_completions_suppressed_in_strings_comments_and_empty_auto(self, tmp_path):
+        ctrl = GuiController(tmp_path)
+        ctrl.execute_script("CREATE TABLE users (id NUMBER, username STRING);\n")
+
+        s_str = "SELECT 'us' FROM users"
+        assert ctrl.get_completions(s_str, s_str.index('us') + 2) is None
+
+        s_cmt = "SELECT * FROM users -- us"
+        assert ctrl.get_completions(s_cmt, len(s_cmt)) is None
+
+        s_empty = "SELECT "
+        assert ctrl.get_completions(s_empty, len(s_empty), manual=False) is None
+        r_manual = ctrl.get_completions(s_empty, len(s_empty), manual=True)
+        assert r_manual is not None
+        assert len(r_manual.items) > 0

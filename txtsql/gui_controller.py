@@ -21,6 +21,20 @@ NULL_DISPLAY = '<NULL>'
 _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 _LINE_COMMENT_RE = re.compile(r'--[^\n]*')
 
+SQL_KEYWORDS: tuple[str, ...] = (
+    'CREATE', 'DROP', 'TABLE', 'IF', 'NOT', 'EXISTS', 'INSERT', 'INTO', 'VALUES',
+    'SELECT', 'DISTINCT', 'FROM', 'WHERE', 'AND', 'OR', 'IS', 'NULL', 'TRUE', 'FALSE',
+    'IN', 'BETWEEN', 'LIKE', 'ANY', 'ALL', 'UNION', 'JOIN', 'INNER', 'LEFT', 'RIGHT',
+    'FULL', 'OUTER', 'CROSS', 'NATURAL', 'ON', 'USING', 'AS', 'GROUP', 'BY', 'HAVING',
+    'ORDER', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'UPDATE', 'SET', 'DELETE', 'IMPORT',
+    'OUTFILE', 'SHOW', 'TABLES', 'DESCRIBE', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
+    'STRING', 'NUMBER', 'VARCHAR', 'DECIMAL', 'INT',
+)
+AGG_FUNCTIONS: tuple[str, ...] = ('COUNT', 'SUM', 'AVG', 'MIN', 'MAX')
+_SQL_KEYWORD_SET = frozenset(SQL_KEYWORDS)
+_TABLE_CONTEXT_KW = frozenset({'FROM', 'JOIN', 'INTO', 'UPDATE', 'DESCRIBE', 'TABLE', 'IMPORT'})
+_IDENT_TOKEN_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
 
 @dataclass(frozen=True, slots=True)
 class TableMeta:
@@ -123,14 +137,62 @@ DEMO_TEMPLATES: dict[str, str] = {
 }
 
 
-def split_sql_statements(script: str) -> list[str]:
-    """Split a SQL script by semicolons outside string literals and -- line comments."""
-    statements: list[str] = []
+@dataclass(frozen=True)
+class StatementSpan:
+    """Span of an executable SQL statement inside a script."""
+    start: int
+    end: int
+    sql: str
+
+
+@dataclass(frozen=True)
+class CompletionItem:
+    """Single SQL code-completion suggestion."""
+    label: str
+    insert_text: str
+    kind: str  # 'column' | 'table' | 'keyword' | 'function'
+    detail: str = ''
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    """Completion candidates together with the character range to replace."""
+    replace_start: int
+    replace_end: int
+    prefix: str
+    items: tuple[CompletionItem, ...]
+
+
+def _trim_span_start(script: str, start: int, end: int) -> int:
+    pos = start
+    while pos < end:
+        ch = script[pos]
+        if ch.isspace():
+            pos += 1
+        elif ch == '-' and pos + 1 < end and script[pos + 1] == '-':
+            nl = script.find('\n', pos + 2, end)
+            if nl == -1:
+                return end
+            pos = nl + 1
+        else:
+            break
+    return pos
+
+
+def find_statement_spans(script: str) -> list[StatementSpan]:
+    """Locate all executable SQL statements with character spans [start, end)."""
+    spans: list[StatementSpan] = []
     n = len(script)
     i = 0
-    start = 0
+    raw_start = 0
     in_string = False
     in_comment = False
+
+    def _emit(chunk_start: int, chunk_end: int, include_end: int) -> None:
+        real_start = _trim_span_start(script, chunk_start, chunk_end)
+        body = script[real_start:chunk_end].strip()
+        if _has_executable_sql(body):
+            spans.append(StatementSpan(start=real_start, end=include_end, sql=body))
 
     while i < n:
         ch = script[i]
@@ -155,16 +217,195 @@ def split_sql_statements(script: str) -> list[str]:
             i += 2
             continue
         elif ch == ';':
-            chunk = script[start:i].strip()
-            if _has_executable_sql(chunk):
-                statements.append(chunk)
-            start = i + 1
+            _emit(raw_start, i, i + 1)
+            raw_start = i + 1
         i += 1
 
-    tail = script[start:].strip()
-    if _has_executable_sql(tail):
-        statements.append(tail)
-    return statements
+    trimmed_end = len(script.rstrip())
+    if raw_start < trimmed_end:
+        _emit(raw_start, trimmed_end, trimmed_end)
+    return spans
+
+
+def split_sql_statements(script: str) -> list[str]:
+    """Split a SQL script by semicolons outside string literals and -- line comments."""
+    return [span.sql for span in find_statement_spans(script)]
+
+
+def find_active_statement(script: str, cursor_offset: int) -> StatementSpan | None:
+    """Return the StatementSpan under cursor_offset (or sharing its lines), if any."""
+    spans = find_statement_spans(script)
+    if not spans:
+        return None
+
+    offset = max(0, min(cursor_offset, len(script)))
+    for span in spans:
+        if span.start <= offset < span.end:
+            return span
+    for span in spans:
+        if offset == span.end:
+            return span
+
+    cursor_line = script.count('\n', 0, offset)
+    same_line_spans: list[StatementSpan] = []
+    for span in spans:
+        start_line = script.count('\n', 0, span.start)
+        end_probe = max(span.start, span.end - 1)
+        end_line = script.count('\n', 0, end_probe)
+        if start_line <= cursor_line <= end_line:
+            same_line_spans.append(span)
+
+    if not same_line_spans:
+        return None
+    if len(same_line_spans) == 1:
+        return same_line_spans[0]
+
+    before = [s for s in same_line_spans if s.end <= offset]
+    if before:
+        return before[-1]
+    return min(same_line_spans, key=lambda s: abs(s.start - offset))
+
+
+def _is_inside_string_or_comment(script: str, cursor_offset: int) -> bool:
+    """Return True if cursor_offset lies inside a string literal or -- line comment."""
+    limit = max(0, min(cursor_offset, len(script)))
+    i = 0
+    in_string = False
+    in_comment = False
+    while i < limit:
+        ch = script[i]
+        if in_comment:
+            if ch == '\n':
+                in_comment = False
+            i += 1
+            continue
+        if in_string:
+            if ch == "'":
+                if i + 1 < limit and script[i + 1] == "'":
+                    i += 2
+                    continue
+                in_string = False
+            i += 1
+            continue
+        if ch == "'":
+            in_string = True
+        elif ch == '-' and i + 1 < limit and script[i + 1] == '-':
+            in_comment = True
+            i += 2
+            continue
+        i += 1
+    return in_string or in_comment
+
+
+def _mask_strings_and_comments(sql: str) -> str:
+    """Replace string literals and -- line comments with spaces while preserving length."""
+    chars = list(sql)
+    n = len(chars)
+    i = 0
+    in_string = False
+    in_comment = False
+    while i < n:
+        ch = chars[i]
+        if in_comment:
+            if ch == '\n':
+                in_comment = False
+            else:
+                chars[i] = ' '
+            i += 1
+            continue
+        if in_string:
+            chars[i] = ' '
+            if ch == "'":
+                if i + 1 < n and chars[i + 1] == "'":
+                    chars[i + 1] = ' '
+                    i += 2
+                    continue
+                in_string = False
+            i += 1
+            continue
+        if ch == "'":
+            chars[i] = ' '
+            in_string = True
+        elif ch == '-' and i + 1 < n and chars[i + 1] == '-':
+            chars[i] = ' '
+            chars[i + 1] = ' '
+            in_comment = True
+            i += 2
+            continue
+        i += 1
+    return ''.join(chars)
+
+
+_ALIAS_SCAN_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*|,')
+
+
+def _extract_table_aliases(sql: str, known_tables: dict[str, TableMeta]) -> tuple[dict[str, str], list[str]]:
+    """Extract (alias_lower -> table_name, referenced_tables) from a SQL statement."""
+    masked = _mask_strings_and_comments(sql)
+    tokens = _ALIAS_SCAN_RE.findall(masked)
+    alias_map: dict[str, str] = {}
+    referenced: list[str] = []
+    seen_tables: set[str] = set()
+
+    def _record(tbl_token: str, alias_token: str | None = None) -> None:
+        meta = known_tables.get(tbl_token.lower())
+        if meta is None:
+            return
+        name = meta.name
+        if name not in seen_tables:
+            seen_tables.add(name)
+            referenced.append(name)
+        alias_map[name.lower()] = name
+        if alias_token and alias_token != ',' and alias_token.upper() not in _SQL_KEYWORD_SET:
+            alias_map[alias_token.lower()] = name
+
+    i = 0
+    n = len(tokens)
+    while i < n:
+        upper = tokens[i].upper()
+        if upper in ('FROM', 'JOIN'):
+            i += 1
+            while i < n:
+                tbl = tokens[i]
+                if tbl == ',' or tbl.upper() in _SQL_KEYWORD_SET:
+                    break
+                i += 1
+                alias = None
+                if i < n and tokens[i].upper() == 'AS':
+                    i += 1
+                    if i < n and tokens[i] != ',' and tokens[i].upper() not in _SQL_KEYWORD_SET:
+                        alias = tokens[i]
+                        i += 1
+                elif i < n and tokens[i] != ',' and tokens[i].upper() not in _SQL_KEYWORD_SET:
+                    alias = tokens[i]
+                    i += 1
+                _record(tbl, alias)
+                if i < n and tokens[i] == ',':
+                    i += 1
+                    continue
+                break
+            continue
+        if upper in ('INTO', 'UPDATE', 'DESCRIBE', 'TABLE', 'IMPORT'):
+            idx = i + 1
+            if upper == 'TABLE':
+                if idx < n and tokens[idx].upper() == 'IF':
+                    idx += 1
+                    if idx < n and tokens[idx].upper() == 'NOT':
+                        idx += 1
+                    if idx < n and tokens[idx].upper() == 'EXISTS':
+                        idx += 1
+            if idx < n and tokens[idx] != ',' and tokens[idx].upper() not in _SQL_KEYWORD_SET:
+                alias = None
+                if upper == 'UPDATE' and idx + 1 < n:
+                    nxt = tokens[idx + 1]
+                    if nxt.upper() == 'AS' and idx + 2 < n and tokens[idx + 2].upper() not in _SQL_KEYWORD_SET:
+                        alias = tokens[idx + 2]
+                    elif nxt != ',' and nxt.upper() not in _SQL_KEYWORD_SET:
+                        alias = nxt
+                _record(tokens[idx], alias)
+        i += 1
+
+    return alias_map, referenced
 
 
 def _has_executable_sql(chunk: str) -> bool:
@@ -248,6 +489,152 @@ class GuiController:
         self.db = Database(Path(data_dir).resolve())
         self.last_tabular_result = None
         return self.db.data_dir
+
+    def get_completions(self, script: str, cursor_offset: int, manual: bool = False) -> CompletionResult | None:
+        """Compute context-aware SQL completions for the current cursor offset."""
+        offset = max(0, min(cursor_offset, len(script)))
+        if _is_inside_string_or_comment(script, offset):
+            return None
+
+        metas = self.get_metadata()
+        known_tables: dict[str, TableMeta] = {m.name.lower(): m for m in metas}
+
+        active = find_active_statement(script, offset)
+        if active is not None:
+            stmt_sql = active.sql
+            stmt_before_cursor = script[active.start:offset] if offset >= active.start else ''
+        else:
+            stmt_sql = script[:offset]
+            stmt_before_cursor = stmt_sql
+
+        alias_map, referenced_tables = _extract_table_aliases(stmt_sql, known_tables)
+        before_cursor = script[:offset]
+
+        # 1. Qualified column completion: table.col or alias.col
+        qual_match = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]*)$', before_cursor)
+        if qual_match:
+            qualifier = qual_match.group(1).lower()
+            prefix = qual_match.group(2)
+            replace_start = offset - len(prefix)
+            target_name = alias_map.get(qualifier)
+            if target_name is None and qualifier in known_tables:
+                target_name = known_tables[qualifier].name
+            if target_name is None:
+                return None
+            meta = known_tables[target_name.lower()]
+            prefix_lower = prefix.lower()
+            items = [
+                CompletionItem(
+                    label=col_name,
+                    insert_text=col_name,
+                    kind='column',
+                    detail=f'{meta.name} ({col_type})',
+                )
+                for col_name, col_type in meta.columns
+                if col_name.lower().startswith(prefix_lower)
+            ]
+            if not items:
+                return None
+            return CompletionResult(
+                replace_start=replace_start,
+                replace_end=offset,
+                prefix=prefix,
+                items=tuple(items[:20]),
+            )
+
+        # 2. Identifier prefix
+        id_match = re.search(r'([A-Za-z_][A-Za-z0-9_]*)$', before_cursor)
+        prefix = id_match.group(1) if id_match else ''
+        replace_start = offset - len(prefix)
+
+        if not prefix and not manual:
+            return None
+
+        prefix_lower = prefix.lower()
+        masked_before = _mask_strings_and_comments(
+            script[active.start:replace_start] if active and replace_start >= active.start else stmt_before_cursor[:max(0, len(stmt_before_cursor) - len(prefix))]
+        )
+        prev_tokens = _IDENT_TOKEN_RE.findall(masked_before)
+        prev_kw = prev_tokens[-1].upper() if prev_tokens else ''
+
+        candidates: list[CompletionItem] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _add(item: CompletionItem) -> None:
+            key = (item.label.lower(), item.kind)
+            if key not in seen and item.label.lower().startswith(prefix_lower):
+                seen.add(key)
+                candidates.append(item)
+
+        if prev_kw in _TABLE_CONTEXT_KW:
+            for meta in metas:
+                _add(CompletionItem(
+                    label=meta.name,
+                    insert_text=meta.name,
+                    kind='table',
+                    detail=f'表 ({meta.row_count} 行)',
+                ))
+        else:
+            # Priority: active table columns > agg functions > keywords > tables > other columns
+            ref_set = {name.lower() for name in referenced_tables}
+            for tbl_name in referenced_tables:
+                meta = known_tables.get(tbl_name.lower())
+                if meta:
+                    for col_name, col_type in meta.columns:
+                        _add(CompletionItem(
+                            label=col_name,
+                            insert_text=col_name,
+                            kind='column',
+                            detail=f'{meta.name} ({col_type})',
+                        ))
+
+            for fn in AGG_FUNCTIONS:
+                _add(CompletionItem(
+                    label=fn,
+                    insert_text=fn,
+                    kind='function',
+                    detail='聚合函数',
+                ))
+
+            for kw in SQL_KEYWORDS:
+                if kw not in AGG_FUNCTIONS:
+                    _add(CompletionItem(
+                        label=kw,
+                        insert_text=kw,
+                        kind='keyword',
+                        detail='关键字',
+                    ))
+
+            for meta in metas:
+                _add(CompletionItem(
+                    label=meta.name,
+                    insert_text=meta.name,
+                    kind='table',
+                    detail=f'表 ({meta.row_count} 行)',
+                ))
+
+            for meta in metas:
+                if meta.name.lower() in ref_set:
+                    continue
+                for col_name, col_type in meta.columns:
+                    _add(CompletionItem(
+                        label=col_name,
+                        insert_text=col_name,
+                        kind='column',
+                        detail=f'{meta.name}.{col_name} ({col_type})',
+                    ))
+
+        if not candidates:
+            return None
+        if not manual and len(candidates) == 1 and candidates[0].label.lower() == prefix_lower:
+            return None
+
+        return CompletionResult(
+            replace_start=replace_start,
+            replace_end=offset,
+            prefix=prefix,
+            items=tuple(candidates[:20]),
+        )
 
     def get_metadata(self, filter_text: str = '') -> list[TableMeta]:
         """Load table list with row counts and column definitions, optionally filtered."""
