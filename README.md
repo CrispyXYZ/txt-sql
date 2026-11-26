@@ -5,24 +5,27 @@ A lightweight DBMS that stores data in tab-separated-value (TSV) files with a si
 ## Architecture
 
 ```
-SQL string → Lexer → Tokens → Parser → AST → Executor → Storage (TSV files)
-                                  ↓
-                            Evaluator (WHERE / HAVING)
+SQL string → Lexer → Tokens → Parser → AST → Optimizer → Executor → Storage (TSV + Indexes)
+                                                ↓           ↓
+                                          Plan / Trace   Evaluator (3VL)
 ```
 
 | Module | Role |
 |---|---|
 | `lexer.py` | Tokenises SQL text into `Token` stream |
 | `parser.py` | Recursive-descent parser producing AST nodes (`ast.py`) |
-| `evaluator.py` | Evaluates expressions & compiles predicates with `EvalContext` |
-| `executor.py` | `QueryExecutor` runs statements against `StorageEngine` |
+| `index.py` | In-memory hybrid Hash + sorted-array (`bisect`) secondary indexes (`ColumnIndex`) |
+| `optimizer.py` | Predicate pushdown (outer-join safe), implicit comma-join rewrite, equi-join key extraction |
+| `plan.py` | `PlanNode` tree, runtime operator metrics, token & AST serialization (`EXPLAIN [ANALYZE]`) |
+| `evaluator.py` | Evaluates expressions & compiles SQL three-valued-logic predicates (`EvalContext`) |
+| `executor.py` | `QueryExecutor` runs statements (Index Scan, Hash Join, `EXPLAIN`, transactions, `CHECK TABLE`) |
 | `io_handlers.py` | External `.xlsx` / `.csv` / `.tsv` import and export |
-| `storage.py` | Directory-scoped `StorageEngine` & `Table` with atomic TSV writes |
-| `result.py` | Structured `QueryResult` and `StatementKind` |
-| `engine.py` | `Database(data_dir)` session orchestrator & `execute_sql()` |
+| `storage.py` | Directory-scoped `StorageEngine` & `Table` with `(mtime_ns, size)` cache, `indexes.txt`, and snapshots |
+| `result.py` | Structured `QueryResult` (including `plan`, `tokens_info`, `ast_tree`) and `StatementKind` |
+| `engine.py` | `Database(data_dir, enable_optimizations=True)` orchestrator & `execute_sql()` |
 | `cli.py` | Interactive REPL with ASCII table output |
-| `gui_controller.py` | Headless GUI controller (script splitting, history, metadata, formatting) |
-| `gui.py` | Tkinter desktop GUI client (`txtsql-gui`) |
+| `gui_controller.py` | Headless GUI controller (script spans, context autocomplete, history, metadata, formatting) |
+| `gui.py` | Tkinter desktop GUI client (`txtsql-gui`) with active-statement highlight & plan visualizer |
 
 ## Requirements
 
@@ -153,6 +156,38 @@ DELETE FROM table_name [WHERE condition];
 DROP TABLE [IF EXISTS] table_name;
 ```
 
+### Secondary Indexes
+
+```sql
+CREATE INDEX [IF NOT EXISTS] idx_name ON table_name (column_name);
+DROP INDEX [IF EXISTS] idx_name;
+SHOW INDEXES [FROM table_name];
+```
+- Hybrid in-memory Hash (`=` / `IN`) + sorted array `bisect` (`>` / `>=` / `<` / `<=` / `BETWEEN`) secondary index
+- Index metadata persisted in `indexes.txt`; automatically invalidated and rebuilt when `.txt` files are updated via SQL or edited externally
+- `DROP TABLE` automatically cascades and removes associated indexes
+
+### EXPLAIN & EXPLAIN ANALYZE
+
+```sql
+EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.uid WHERE u.city = 'Harbin';
+EXPLAIN ANALYZE SELECT * FROM scores WHERE grade BETWEEN 80 AND 100;
+```
+- `EXPLAIN` prints the logical/physical plan tree highlighting `IndexScan`, `HashJoin`, and `Predicate Pushdown`
+- `EXPLAIN ANALYZE` executes the query and reports per-operator `RowsIn`, `RowsOut`, `Selectivity`, and `Time(ms)`
+
+### Integrity Audit & Snapshot Transactions
+
+```sql
+CHECK TABLE table_name;
+
+BEGIN [TRANSACTION];
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+ROLLBACK [TRANSACTION];   -- or COMMIT [TRANSACTION];
+```
+- `CHECK TABLE` scans the TSV file and reports exact 1-based line numbers for column-count mismatches or invalid `NUMBER` values
+- `BEGIN` / `COMMIT` / `ROLLBACK` provide directory-level atomic snapshot rollback across DML, DDL, and index changes
+
 ### SHOW TABLES / DESCRIBE (system commands)
 
 ```sql
@@ -207,17 +242,39 @@ Tables are stored as TSV files in the working directory:
 
 ```
 metadata.txt          — table registry (name, column count, col_name, type, ...)
+indexes.txt           — secondary index registry (index_name, table_name, column_name)
 <table_name>.txt      — data rows (tab-separated, QUOTE_ALL quoting)
 ```
 
 - `NULL` values are stored using the `\N` sentinel; literal backslashes in strings are escaped (`\\`), so empty strings `''` and `NULL` are strictly distinguished
-- All writes (including `metadata.txt` updates on `DROP TABLE`) are atomic (temp file + rename)
+- All writes (including `metadata.txt`, `indexes.txt`, and transaction rollback restores) are atomic (temp file + rename)
+- Row and index caches track `(st_mtime_ns, st_size)` file fingerprints to automatically detect external edits
 - TSV quoting protects strings containing tabs, newlines, or quotes
+
+## Query Optimization & Benchmarks
+
+TxtSql includes an automated optimizer pipeline (`Database(data_dir, enable_optimizations=True)`) featuring Hash Join (`O(M + N)`), outer-join-safe Predicate Pushdown, implicit comma-join rewriting, and hybrid Hash/`bisect` Index Scan.
+
+Run the benchmark suite locally:
+
+```bash
+.venv/bin/python benchmarks/run_benchmark.py
+```
+
+Measured local results (with result-equivalence assertions against `enable_optimizations=False`):
+
+| Scenario | Scale | Unoptimized (ms) | Optimized (ms) | Speedup | Mechanism |
+|---|---|---|---|---|---|
+| Equi-Join (`JOIN`) | 1,000 × 1,000 rows | 2220.82 | 3.65 | **608.1x** | Hash Join (`O(M+N)`) |
+| Equi-Join (`JOIN`) | 2,000 × 2,000 rows | 9154.34 | 8.92 | **1026.4x** | Hash Join (`O(M+N)`) |
+| Point Lookup (`=`) | 10,000 rows | 15.73 | 0.16 | **98.2x** | Hash Secondary Index (`IndexScan`) |
+| Range Query (`BETWEEN`) | 10,000 rows | 24.88 | 0.23 | **106.9x** | Sorted Array `bisect` |
+| Comma Join + Filters | 1,200 × 1,200 rows | 7294.73 | 2.83 | **2580.8x** | Index + Pushdown + Implicit Rewrite + Hash Join |
 
 ## Limitations
 
-- No transactions
-- No indexes — all queries scan the full table
+- Single-session directory-level snapshot transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) without multi-client concurrency locks or WAL recovery
+- Secondary indexes are rebuilt in memory from TSV files on first query or file modification rather than stored as on-disk B+ trees
 - `DISTINCT` applies to the SELECT result row; `ORDER BY` supports column names, qualified names, and SELECT aliases (not arbitrary expressions)
 
 ## License
