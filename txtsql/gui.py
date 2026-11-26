@@ -239,6 +239,7 @@ class TxtSqlApp:
         self._highlight_job: str | None = None
         self._sort_state: tuple[str, bool] | None = None
         self._current_columns: tuple[str, ...] = ()
+        self._displayed_rows: list = []
         self._log_handler: _TkLogHandler | None = None
 
         self._configure_window()
@@ -292,8 +293,10 @@ class TxtSqlApp:
             style.theme_use('clam')
         except tk.TclError:
             pass
-        default_font = tkfont.nametofont('TkDefaultFont')
-        line_h = default_font.metrics('linespace') or 20
+        self._body_font = tkfont.nametofont('TkDefaultFont')
+        self._heading_font = tkfont.Font(font=self._body_font)
+        self._heading_font.configure(weight='bold')
+        line_h = self._body_font.metrics('linespace') or 20
         row_h = max(34, int(line_h * 1.65))
 
         style.configure('TButton', padding=(10, 5))
@@ -305,7 +308,7 @@ class TxtSqlApp:
         style.configure('TEntry', padding=(4, 3))
         style.configure('TNotebook.Tab', padding=(12, 6))
         style.configure('Treeview', rowheight=row_h)
-        style.configure('Treeview.Heading', padding=(8, 6), font=('TkDefaultFont', 9, 'bold'))
+        style.configure('Treeview.Heading', padding=(8, 6), font=self._heading_font)
 
     # ------------------------------------------------------------------
     # Menu & Toolbar
@@ -815,7 +818,8 @@ class TxtSqlApp:
             self.refresh_metadata()
 
         if report.last_tabular is not None:
-            self._render_result_table(report.last_tabular)
+            self._sort_state = None
+            self._render_result_table(report.last_tabular, preserve_widths=False)
             self.notebook.select(0)
         elif report.error_count > 0:
             self.notebook.select(1)
@@ -859,24 +863,44 @@ class TxtSqlApp:
         recent = [' '.join(h.sql.split())[:80] for h in reversed(self.controller.history[-20:])]
         self.history_combo['values'] = recent
 
-    def _render_result_table(self, result: QueryResult, sorted_rows: list | None = None) -> None:
+    def _compute_column_width(self, col: str, rows: list) -> int:
+        """Compute pixel width fitting both header (including sort marker) and cell contents."""
+        header_px = self._heading_font.measure(f'{col} ▼') + 28
+        content_px = 0
+        for row in rows[:500]:
+            text = format_cell_single_line(row.get(col))
+            w = self._body_font.measure(text) + 28
+            if w > content_px:
+                content_px = w
+        return min(max(header_px, content_px, 90), 600)
+
+    def _render_result_table(
+        self,
+        result: QueryResult,
+        sorted_rows: list | None = None,
+        preserve_widths: bool = False,
+    ) -> None:
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
 
         cols = result.columns
         self._current_columns = cols
         rows = sorted_rows if sorted_rows is not None else result.rows
+        self._displayed_rows = rows
 
-        self.result_tree['columns'] = cols
+        columns_changed = tuple(self.result_tree['columns']) != cols
+        if columns_changed:
+            self.result_tree['columns'] = cols
+
         for col in cols:
             marker = ''
             if self._sort_state and self._sort_state[0] == col:
                 marker = ' ▼' if self._sort_state[1] else ' ▲'
             self.result_tree.heading(col, text=f'{col}{marker}', command=lambda c=col: self._sort_by_column(c))
 
-            max_w = max([len(col)] + [len(format_cell_single_line(r.get(col), max_len=40)) for r in rows[:100]])
-            col_px = min(max(max_w * 9 + 24, 80), 320)
-            self.result_tree.column(col, width=col_px, minwidth=60, stretch=False)
+            if not preserve_widths or columns_changed:
+                col_px = self._compute_column_width(col, rows)
+                self.result_tree.column(col, width=col_px, minwidth=70, stretch=False)
 
         for idx, row in enumerate(rows):
             vals = [format_cell_single_line(row.get(c)) for c in cols]
@@ -894,7 +918,7 @@ class TxtSqlApp:
             desc = not self._sort_state[1]
         self._sort_state = (col, desc)
         sorted_rows = sort_rows_for_view(res.rows, col, descending=desc)
-        self._render_result_table(res, sorted_rows=sorted_rows)
+        self._render_result_table(res, sorted_rows=sorted_rows, preserve_widths=True)
 
     def _on_result_double_click(self, event: tk.Event) -> None:
         item_iid = self.result_tree.identify_row(event.y)
@@ -905,10 +929,9 @@ class TxtSqlApp:
         if not (0 <= col_idx < len(self._current_columns)):
             return
         col_name = self._current_columns[col_idx]
-        res = self.controller.last_tabular_result
         row_idx = int(item_iid)
-        if res is not None and 0 <= row_idx < len(res.rows) and self._sort_state is None:
-            raw_val = res.rows[row_idx].get(col_name)
+        if 0 <= row_idx < len(self._displayed_rows):
+            raw_val = self._displayed_rows[row_idx].get(col_name)
             text = format_cell_display(raw_val)
         else:
             values = self.result_tree.item(item_iid, 'values')
