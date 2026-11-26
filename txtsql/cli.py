@@ -10,6 +10,10 @@ from .engine import execute_sql
 from .exceptions import TxtSqlError
 
 
+def _format_cell(value: Any) -> str:
+    return '' if value is None else str(value)
+
+
 def print_table(rows: Sequence[Mapping[str, Any]]) -> None:
     """Print a list of dictionaries as a formatted ASCII table with borders."""
     if not rows:
@@ -22,7 +26,7 @@ def print_table(rows: Sequence[Mapping[str, Any]]) -> None:
     widths = {h: len(h) for h in headers}
     for row in rows:
         for h in headers:
-            val = str(row.get(h, ''))
+            val = _format_cell(row.get(h))
             widths[h] = max(widths[h], len(val))
 
     separator = "+" + "+".join("-" * (widths[h] + 2) for h in headers) + "+"
@@ -34,7 +38,7 @@ def print_table(rows: Sequence[Mapping[str, Any]]) -> None:
     print(separator)
 
     for row in rows:
-        row_str = "|" + "|".join(f" {str(row.get(h, '')).ljust(widths[h])} " for h in headers) + "|"
+        row_str = "|" + "|".join(f" {_format_cell(row.get(h)).ljust(widths[h])} " for h in headers) + "|"
         print(row_str)
 
     print(separator)
@@ -54,15 +58,33 @@ def run_cli() -> None:
     while True:
         try:
             line = input(prompt)
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print()
-            if buffer:   # discard incomplete statement and restart
+            if buffer:
                 buffer.clear()
                 prompt = "txtsql> "
                 continue
-            break        # exit if no pending input
+            break
+        except KeyboardInterrupt:
+            print()
+            if buffer:
+                buffer.clear()
+                prompt = "txtsql> "
+                continue
+            break
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            traceback.print_exc()
+            if buffer:
+                buffer.clear()
+                prompt = "txtsql> "
+            continue
 
         stripped = line.strip()
+
+        # Skip empty lines when buffer is empty
+        if not buffer and not stripped:
+            continue
 
         # Exit command only when buffer is empty
         if not buffer and stripped.lower() in ('exit', 'quit'):

@@ -50,9 +50,10 @@ class TestPrintTable:
 
     def test_none_value_displayed_as_empty_string(self):
         lines = self._capture([{"val": None}])
-        # None should not cause an error and should appear as ''
+        # None should not cause an error and should appear as empty space, not 'None'
         data_line = next(l for l in lines if "|" in l and "val" not in l)
         assert "|" in data_line
+        assert "None" not in data_line
 
     def test_accepts_sequence_of_mappings(self):
         """print_table should accept Sequence[Mapping[str, Any]], not just list[dict]."""
@@ -98,17 +99,17 @@ class TestRunCli:
         # No errors expected
 
     def test_sql_error_prints_error_message(self, capsys):
-        with patch("builtins.input", side_effect=["INVALID SQL HERE", "exit"]):
+        with patch("builtins.input", side_effect=["INVALID SQL HERE;", "exit"]):
             run_cli()
         out = capsys.readouterr().out
         assert "Error:" in out
 
     def test_select_result_prints_table(self, capsys):
         with patch("builtins.input", side_effect=[
-            "CREATE TABLE t (id NUMBER, name STRING)",
-            "INSERT INTO t VALUES (1, 'Alice')",
-            "SELECT * FROM t",
-            "DROP TABLE t",
+            "CREATE TABLE t (id NUMBER, name STRING);",
+            "INSERT INTO t VALUES (1, 'Alice');",
+            "SELECT * FROM t;",
+            "DROP TABLE t;",
             "exit",
         ]):
             run_cli()
@@ -118,8 +119,8 @@ class TestRunCli:
 
     def test_non_select_query_prints_query_ok(self, capsys):
         with patch("builtins.input", side_effect=[
-            "CREATE TABLE t2 (id NUMBER)",
-            "DROP TABLE t2",
+            "CREATE TABLE t2 (id NUMBER);",
+            "DROP TABLE t2;",
             "exit",
         ]):
             run_cli()
@@ -128,7 +129,7 @@ class TestRunCli:
 
     def test_system_error_shows_traceback(self, capsys):
         with patch("builtins.input", side_effect=[
-            "CREATE TABLE t3 (id NUMBER)",
+            "CREATE TABLE t3 (id NUMBER);",
             RuntimeError("Something went wrong"),
             "exit",
         ]):

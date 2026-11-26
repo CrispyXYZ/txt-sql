@@ -20,6 +20,8 @@ __pycache__/
 temp/
 tmp/
 
+docs-local/
+
 # Data files (TSV storage)
 *.txt
 !README.md

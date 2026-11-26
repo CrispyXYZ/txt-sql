@@ -1,8 +1,9 @@
 """AST node definitions for TxtSQL statements and expressions."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
+
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -37,6 +38,21 @@ class ComparisonOp(Enum):
     LE = '<='
 
 
+class ArithmeticOp(Enum):
+    ADD = '+'
+    SUB = '-'
+    MUL = '*'
+    DIV = '/'
+
+
+class JoinType(Enum):
+    INNER = 'INNER'
+    LEFT = 'LEFT'
+    RIGHT = 'RIGHT'
+    FULL = 'FULL'
+    CROSS = 'CROSS'
+
+
 # ---------------------------------------------------------------------------
 # Expression nodes
 # ---------------------------------------------------------------------------
@@ -54,23 +70,32 @@ class LiteralExpression(Expression):
 
 @dataclass
 class ColumnExpression(Expression):
-    """Column reference: name, score."""
+    """Column reference: col or table.col."""
     column_name: str
+    table: str | None = None  # None = no table prefix
+
+
+@dataclass
+class BinaryExpression(Expression):
+    """Arithmetic: left op right (e.g. a + b, 2 * price)."""
+    left: Expression
+    op: ArithmeticOp
+    right: Expression
 
 
 @dataclass
 class NullCheckExpression(Expression):
-    """NULL check: column IS [NOT] NULL."""
-    column: ColumnExpression
+    """NULL check: expr IS [NOT] NULL."""
+    expr: Expression
     is_null: bool  # True for IS NULL, False for IS NOT NULL
 
 
 @dataclass
 class ConditionExpression(Expression):
-    """Comparison: column op literal (e.g. age > 18)."""
-    column: ColumnExpression
+    """Comparison: left op right (e.g. col > 5, a + b = c)."""
+    left: Expression
     op: ComparisonOp
-    literal: LiteralExpression
+    right: Expression
 
 
 @dataclass
@@ -79,6 +104,37 @@ class LogicalExpression(Expression):
     left: Expression
     op: LogicalOp
     right: Expression
+
+
+@dataclass
+class AggregateExpression(Expression):
+    """Aggregate function call: COUNT(*), SUM(col), SUM(t.col)."""
+    func: AggFunc
+    column: ColumnExpression | None  # None for COUNT(*)
+
+
+@dataclass
+class InExpression(Expression):
+    """expr IN (subquery) or expr NOT IN (subquery)."""
+    expr: Expression
+    subquery: 'SelectStatement | UnionStatement'
+    not_in: bool = False
+
+
+@dataclass
+class AnyAllExpression(Expression):
+    """expr op ANY|ALL (subquery)."""
+    expr: Expression
+    op: ComparisonOp
+    quantifier: str  # 'ANY' or 'ALL'
+    subquery: 'SelectStatement | UnionStatement'
+
+
+@dataclass
+class ExistsExpression(Expression):
+    """[NOT] EXISTS (subquery)."""
+    subquery: 'SelectStatement | UnionStatement'
+    negated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +157,29 @@ class AggregateColumn:
     func: AggFunc
     column: str | None  # None for COUNT(*)
     alias: str
+
+
+@dataclass
+class SelectExpression:
+    """A single item in the SELECT list."""
+    expr: Expression
+    alias: str | None  # None = no alias; resolved name = column_name or alias
+
+
+@dataclass(slots=True, frozen=True)
+class TableSource:
+    """A table reference in the FROM clause."""
+    name: str          # table name
+    alias: str | None  # None means use table name as alias
+
+
+@dataclass(slots=True, frozen=True)
+class JoinClause:
+    join_type: JoinType
+    source: TableSource
+    condition: Expression | None = None  # ON condition
+    using_columns: tuple[str, ...] | None = None  # USING (col, ...)
+    natural: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -133,17 +212,28 @@ class DeleteStatement:
 
 @dataclass(slots=True, frozen=True)
 class SelectStatement:
-    table_name: str
-    columns: list[str] | None  # None means SELECT *
-    aggregates: list[AggregateColumn]
-    distinct: bool
-    where_clause: WhereClause | None
-    group_by: list[str] | None
-    having: WhereClause | None
-    order_by: list[tuple[str, bool]] | None  # (column, desc)
-    limit: int | None
-    offset: int
-    output_file: str | None  # INTO OUTFILE path; None for normal SELECT
+    sources: list[TableSource]
+    joins: list[JoinClause]
+    columns: list[SelectExpression] | None  # None means SELECT *
+    aggregates: list[AggregateColumn] = field(default_factory=list)
+    distinct: bool = False
+    where_clause: WhereClause | None = None
+    group_by: list[ColumnExpression] | None = None
+    having: WhereClause | None = None
+    order_by: list[tuple[ColumnExpression, bool]] | None = None  # (column, desc)
+    limit: int | None = None
+    offset: int = 0
+    output_file: str | None = None  # INTO OUTFILE path; None for normal SELECT
+
+
+@dataclass(slots=True, frozen=True)
+class UnionStatement:
+    """SELECT ... UNION [ALL] SELECT ..."""
+    branches: list[tuple[SelectStatement, bool]]  # [(first, False), (next, is_all), ...]
+    order_by: list[tuple[ColumnExpression, bool]] | None = None
+    limit: int | None = None
+    offset: int = 0
+    output_file: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

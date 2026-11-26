@@ -7,12 +7,13 @@ import tempfile
 from collections.abc import Callable
 from decimal import Decimal
 
-from .exceptions import TableAlreadyExistsError, TableNotFoundError
+from .exceptions import EngineError, TableAlreadyExistsError, TableNotFoundError, TypeMismatchError
 from .types import Types, DataValue, RowDict
 
 _log = logging.getLogger(__name__)
 
 METADATA_FILENAME = 'metadata.txt'
+_NULL_SENTINEL = '\\N'
 
 
 # Sentinel object used internally to mean "leave this column unchanged" during UPDATE
@@ -30,11 +31,13 @@ _UNCHANGED = _Unchanged()
 def create_table(name: str, defs: dict[str, Types]) -> Table:
     """Create a table and return it."""
     _log.debug(f'Creating table: {name}')
+    if not defs:
+        raise EngineError('Table must have at least one column')
 
     try:
         with open(METADATA_FILENAME, 'r', encoding='utf-8') as metadata:
             reader = csv.reader(metadata, delimiter='\t')
-            if any(row[0] == name for row in reader):
+            if any(row and row[0] == name for row in reader):
                 raise TableAlreadyExistsError(f'Table already exists: {name}')
     except FileNotFoundError:
         pass
@@ -55,7 +58,7 @@ def get_table(name: str) -> Table | None:
     try:
         with open(METADATA_FILENAME, 'r', encoding='utf-8') as metadata:
             reader = csv.reader(metadata, delimiter='\t')
-            row = next((row for row in reader if row[0] == name), None)
+            row = next((row for row in reader if row and row[0] == name), None)
             if row is None:
                 return None
             count = int(row[1])
@@ -66,8 +69,8 @@ def get_table(name: str) -> Table | None:
 
 
 def list_tables() -> list[tuple[str, int, dict[str, str]]]:
-    """Return all tables with their row counts and column definitions.
-    Returns: list of (table_name, row_count, {col_name: col_type_str})
+    """Return all tables with their definitions.
+    Returns: list of (table_name, col_count, {col_name: col_type_str})
     """
     result: list[tuple[str, int, dict[str, str]]] = []
     try:
@@ -86,27 +89,61 @@ def list_tables() -> list[tuple[str, int, dict[str, str]]]:
 
 
 def drop_table(name: str) -> None:
-    """Drop table and erase metadata."""
+    """Drop table and erase metadata atomically."""
     _log.debug(f'Dropping table: {name}')
     data_filename = f'{name}.txt'
 
+    existing_rows: list[list[str]] = []
+    in_metadata = False
     try:
-        os.remove(data_filename)
+        with open(METADATA_FILENAME, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter='\t')
+            for row in reader:
+                if not row:
+                    continue
+                if row[0] == name:
+                    in_metadata = True
+                else:
+                    existing_rows.append(row)
     except FileNotFoundError:
+        pass
+
+    file_exists = os.path.exists(data_filename)
+    if not in_metadata and not file_exists:
         raise TableNotFoundError(f'Table does not exist: {name}')
 
-    with open(METADATA_FILENAME, 'r', encoding='utf-8') as f:
-        reader = csv.reader(f, delimiter='\t')
-        rows = [row for row in reader if row[0] != name]
+    if file_exists:
+        os.remove(data_filename)
 
-    with open(METADATA_FILENAME, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerows(rows)
+    if os.path.exists(METADATA_FILENAME) or in_metadata:
+        fd, tmp_path = tempfile.mkstemp(dir='.', prefix='.metadata-')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f, delimiter='\t', lineterminator='\n')
+                writer.writerows(existing_rows)
+            os.replace(tmp_path, METADATA_FILENAME)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
 
 # ============================================================================
 # Serialization helpers
 # ============================================================================
+
+def _coerce_number(value: object) -> Decimal:
+    """Validate and convert a Python value to Decimal for a NUMBER column."""
+    if isinstance(value, bool):
+        return Decimal(1) if value else Decimal(0)
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    raise TypeMismatchError(f'Expected NUMBER value, got {type(value).__name__}')
+
 
 def _string_to_number(string: str) -> Decimal:
     return Decimal(string)
@@ -116,34 +153,40 @@ def _number_to_string(number: Decimal) -> str:
     return str(number)
 
 
-def _data_to_string(value: DataValue, type_def: Types) -> str:
-    """Convert data value to string for TSV storage. None (SQL NULL) → empty string."""
+def _data_to_string(value: object, type_def: Types) -> str:
+    """Convert data value to string for TSV storage.
+
+    None (SQL NULL) -> '\\N' sentinel; backslashes in strings are escaped as '\\\\'
+    so empty string '' and literal '\\N' round-trip without ambiguity.
+    """
     if value is None:
-        return ''
+        return _NULL_SENTINEL
     match type_def:
         case Types.NUMBER:
-            return _number_to_string(Decimal(value))
+            return _number_to_string(_coerce_number(value))
         case Types.STRING:
-            return value
+            if not isinstance(value, str):
+                raise TypeMismatchError(f'Expected STRING value, got {type(value).__name__}')
+            return value.replace('\\', '\\\\')
 
 
 def _string_to_data(string: str, type_def: Types) -> DataValue:
-    """Convert TSV string to data value. Empty string → None (SQL NULL)."""
-    if string == '':
+    """Convert TSV field string to typed data value. '\\N' -> None (SQL NULL)."""
+    if string == _NULL_SENTINEL:
         return None
     match type_def:
         case Types.NUMBER:
             return _string_to_number(string)
         case Types.STRING:
-            return string
+            return string.replace('\\\\', '\\')
 
 
 # ============================================================================
-# CSV dialect: tab-separated, non-numeric values quoted (protects \t \n in strings)
+# CSV dialect: tab-separated, all fields quoted so \t \n " \N round-trip cleanly
 # ============================================================================
 
-_CSV_WRITE_KWARGS = dict(delimiter='\t', quoting=csv.QUOTE_NONNUMERIC, lineterminator='\n')
-_CSV_READ_KWARGS = dict(delimiter='\t', quoting=csv.QUOTE_NONNUMERIC)
+_CSV_WRITE_KWARGS = dict(delimiter='\t', quoting=csv.QUOTE_ALL, lineterminator='\n')
+_CSV_READ_KWARGS = dict(delimiter='\t')
 
 
 # ============================================================================
@@ -173,10 +216,11 @@ class Table:
         return dict(self.defs)
 
     def count_rows(self) -> int:
-        """Count records in the table."""
+        """Count records in the table (safe with multi-line strings)."""
         try:
-            with open(self.filename, 'r', encoding='utf-8') as f:
-                return sum(1 for _ in f)
+            with open(self.filename, 'r', encoding='utf-8', newline='') as f:
+                reader = csv.reader(f, **_CSV_READ_KWARGS)
+                return sum(1 for row in reader if row)
         except FileNotFoundError:
             return 0
 
@@ -190,20 +234,27 @@ class Table:
 
     # -- CRUD ----------------------------------------------------------
 
-    def insert_values(self, values: RowDict) -> None:
-        """Insert a row. Use None for SQL NULL."""
-        _log.debug(f'Inserting into {self.name}: {values}')
+    def insert_rows(self, rows: list[RowDict]) -> None:
+        """Validate and append multiple rows atomically at the batch level."""
+        prepared = [
+            [_data_to_string(values.get(key), value) for key, value in self.defs.items()]
+            for values in rows
+        ]
         with open(self.filename, 'a', encoding='utf-8', newline='') as file:
             writer = csv.writer(file, **_CSV_WRITE_KWARGS)
-            row = [_data_to_string(values.get(key), value) for key, value in self.defs.items()]
-            _log.debug(f'Writing: {row}')
-            writer.writerow(row)
+            writer.writerows(prepared)
 
-    def update(self, values: RowDict, where: Callable[[RowDict], bool] | None = None) -> None:
+    def insert_values(self, values: RowDict) -> None:
+        """Insert a single row. Use None for SQL NULL."""
+        _log.debug(f'Inserting into {self.name}: {values}')
+        self.insert_rows([values])
+
+    def update(self, values: RowDict, where: Callable[[RowDict], bool] | None = None) -> int:
         """
         Update rows matching the where predicate.
         :param values: Dictionary of columns to update. Use None for SQL NULL.
         :param where: Row predicate. None means update all rows.
+        :return: Number of matched/updated rows.
         """
         _log.debug(f'Updating {self.name}: {values}')
 
@@ -217,9 +268,10 @@ class Table:
 
         if all(value is _UNCHANGED for value in updated_values):
             _log.warning(f'No values to update: {values}')
-            return
+            return 0
 
         table_values = self._read_raw_rows()
+        updated_count = 0
 
         for i, row in enumerate(table_values):
             if where is None or where(self._row_to_dict(row)):
@@ -227,8 +279,10 @@ class Table:
                     row[j] if updated_values[j] is _UNCHANGED else updated_values[j]
                     for j in range(def_count)
                 ]
+                updated_count += 1
 
         self._write_raw_rows(table_values)
+        return updated_count
 
     def delete(self, where: Callable[[RowDict], bool] | None = None) -> int:
         """
@@ -240,8 +294,8 @@ class Table:
 
         if where is None:
             deleted_count = self.count_rows()
-            with open(self.filename, 'w', encoding='utf-8'):
-                return deleted_count
+            self._write_raw_rows([])
+            return deleted_count
 
         table_values = self._read_raw_rows()
         deleted_count = 0
@@ -301,9 +355,9 @@ class Table:
     def _read_raw_rows(self) -> list[list[str]]:
         """Read all rows from the TSV file as raw string lists."""
         try:
-            with open(self.filename, 'r', encoding='utf-8') as file:
+            with open(self.filename, 'r', encoding='utf-8', newline='') as file:
                 reader = csv.reader(file, **_CSV_READ_KWARGS)
-                return list(reader)
+                return [row for row in reader if row]
         except FileNotFoundError:
             return []
 
@@ -316,7 +370,8 @@ class Table:
                 writer.writerows(rows)
             os.replace(tmp_path, self.filename)
         except Exception:
-            os.remove(tmp_path)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
             raise
 
     def _read_rows(self) -> list[RowDict]:
@@ -334,11 +389,14 @@ class Table:
 
     @staticmethod
     def _dedup(rows: list[RowDict]) -> list[RowDict]:
-        """Remove duplicate rows."""
+        """Remove duplicate rows in a type-safe manner."""
         seen = set()
         result: list[RowDict] = []
         for r in rows:
-            key = tuple(sorted(r.items()))
+            key = tuple(
+                (k, (0, None) if v is None else (1, v) if isinstance(v, Decimal) else (2, v))
+                for k, v in r.items()
+            )
             if key not in seen:
                 seen.add(key)
                 result.append(r)

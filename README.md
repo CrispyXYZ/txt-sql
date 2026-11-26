@@ -78,8 +78,36 @@ SELECT [DISTINCT] col1, col2, ... FROM table_name
     [LIMIT n] [OFFSET n];
 
 SELECT COUNT(*) AS cnt FROM table_name;
-SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept;
+SELECT COUNT(*), dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept HAVING COUNT(*) > 1;
 ```
+
+### Subqueries & UNION
+
+```sql
+SELECT * FROM a WHERE id IN (SELECT id FROM b);
+SELECT * FROM a WHERE EXISTS (SELECT * FROM b WHERE b.id = a.id);
+SELECT * FROM a WHERE score > ANY (SELECT min_score FROM thresholds);
+SELECT id, name FROM a UNION SELECT id, name FROM b ORDER BY id;
+SELECT id, name FROM a UNION ALL SELECT id, name FROM b;
+```
+
+### JOIN
+
+```sql
+SELECT * FROM a JOIN b ON a.id = b.id;
+SELECT * FROM a LEFT JOIN b USING (id);
+SELECT * FROM a RIGHT OUTER JOIN b ON a.id = b.id;
+SELECT * FROM a FULL OUTER JOIN b USING (id);
+SELECT * FROM a CROSS JOIN b;
+SELECT * FROM a NATURAL LEFT JOIN b;
+SELECT * FROM a, b WHERE a.id = b.id;   -- comma is a cross join + WHERE
+```
+
+- `JOIN` / `INNER JOIN` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN` / `FULL [OUTER] JOIN`
+- `CROSS JOIN` (also written as a comma-separated `FROM` list)
+- `NATURAL [INNER | LEFT | RIGHT | FULL] JOIN` matches all common column names
+- `JOIN ... USING (col1, col2)` matches the listed columns and merges them in `SELECT *`
+- `SELECT *` uses unqualified column names; when a name is duplicated across tables, the later columns keep their table qualifier
 
 ### UPDATE
 
@@ -132,15 +160,19 @@ SELECT dept, AVG(salary) AS avg FROM emp GROUP BY dept INTO OUTFILE 'report.csv'
 
 ```sql
 WHERE salary > 50000 AND name <> 'Bob'
-WHERE dept = 'Sales' OR dept = 'Eng'
+WHERE dept = 'Sales' OR dept != 'Eng'
 WHERE score IS NULL
 WHERE (a > 1 AND b < 2) OR c = 3
+WHERE price * qty > 100
 ```
 
-- `=`, `<>`, `>`, `<`, `>=`, `<=`
-- `AND`, `OR`, parentheses
+- `=`, `<>`, `!=`, `>`, `<`, `>=`, `<=`
+- Arithmetic operators `+`, `-`, `*`, `/` (with `NULL` propagation)
+- `AND`, `OR`, parentheses (SQL three-valued logic)
 - `IS NULL`, `IS NOT NULL`
-- `NULL` comparisons always return false (SQL standard)
+- `IN`, `NOT IN`, `ANY`, `ALL`, `EXISTS`, `NOT EXISTS` subqueries
+- `TRUE` / `FALSE` literals evaluate to `NUMBER` `1` / `0`
+- Escaped single quotes (`''`) inside string literals and `--` single-line SQL comments
 
 ## Storage Format
 
@@ -148,21 +180,18 @@ Tables are stored as TSV files in the working directory:
 
 ```
 metadata.txt          — table registry (name, column count, col_name, type, ...)
-<table_name>.txt      — data rows (tab-separated, QUOTE_NONNUMERIC quoting)
+<table_name>.txt      — data rows (tab-separated, QUOTE_ALL quoting)
 ```
 
-- NULL values are stored as empty fields
-- All writes are atomic (temp file + rename)
-- TSV quoting protects strings containing tabs or newlines
+- `NULL` values are stored using the `\N` sentinel; literal backslashes in strings are escaped (`\\`), so empty strings `''` and `NULL` are strictly distinguished
+- All writes (including `metadata.txt` updates on `DROP TABLE`) are atomic (temp file + rename)
+- TSV quoting protects strings containing tabs, newlines, or quotes
 
 ## Limitations
 
-- No joins, subqueries, or transactions
+- No transactions
 - No indexes — all queries scan the full table
-- Strings containing literal `\N` are safe (NULL uses empty field, not `\N` sentinel)
-- AS keyword is mandatory for aggregate aliases: `COUNT(*) AS cnt`
-- DISTINCT only applies to non-aggregate queries
-- No escaped quotes inside string literals
+- `DISTINCT` applies to the SELECT result row; `ORDER BY` supports column names, qualified names, and SELECT aliases (not arbitrary expressions)
 
 ## License
 

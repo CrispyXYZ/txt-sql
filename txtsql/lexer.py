@@ -12,8 +12,8 @@ class TokenType(StrEnum):
     INSERT = 'INSERT'
     INTO = 'INTO'
     VALUES = 'VALUES'
-    TYPE_STRING = 'STRING'
-    TYPE_NUMBER = 'NUMBER'
+    TYPE_STRING = 'TYPE_STRING'
+    TYPE_NUMBER = 'TYPE_NUMBER'
 
     SELECT = 'SELECT'
     DISTINCT = 'DISTINCT'
@@ -42,6 +42,21 @@ class TokenType(StrEnum):
     SHOW = 'SHOW'
     TABLES = 'TABLES'
     DESCRIBE = 'DESCRIBE'
+    LEFT = 'LEFT'
+    RIGHT = 'RIGHT'
+    INNER = 'INNER'
+    FULL = 'FULL'
+    OUTER = 'OUTER'
+    CROSS = 'CROSS'
+    NATURAL = 'NATURAL'
+    JOIN = 'JOIN'
+    ON = 'ON'
+    USING = 'USING'
+    IN = 'IN'
+    EXISTS = 'EXISTS'
+    ANY = 'ANY'
+    ALL = 'ALL'
+    UNION = 'UNION'
     WHERE = 'WHERE'
     AND = 'AND'
     OR = 'OR'
@@ -57,6 +72,11 @@ class TokenType(StrEnum):
     LT = '<'
     GE = '>='
     LE = '<='
+
+    PLUS = '+'
+    MINUS = '-'
+    DIV = '/'
+    DOT = '.'
 
     SEMICOLON = 'SEMICOLON'
     COMMA = 'COMMA'
@@ -108,10 +128,17 @@ class Lexer:
         return None
 
     def skip_whitespace(self) -> None:
-        while self.current_char() is not None and self.current_char().isspace():
-            self.advance()
+        while True:
+            while self.current_char() is not None and self.current_char().isspace():
+                self.advance()
+            if self.current_char() == '-' and self.peek() == '-':
+                while self.current_char() is not None and self.current_char() != '\n':
+                    self.advance()
+            else:
+                break
 
     def read_number(self) -> Token:
+        start_line = self.line
         start_col = self.column
         num_str = ''
         while self.current_char() is not None and self.current_char().isdigit():
@@ -124,18 +151,26 @@ class Lexer:
             while self.current_char() is not None and self.current_char().isdigit():
                 num_str += self.current_char()
                 self.advance()
-        return Token(TokenType.NUMBER, Decimal(num_str), self.line, start_col)
+        return Token(TokenType.NUMBER, Decimal(num_str), start_line, start_col)
 
     def read_string(self) -> Token:
+        start_line = self.line
         start_col = self.column
-        self.advance()  # to skip quote
-        string_str = ''
-        while self.current_char() is not None and self.current_char() != "'":
-            string_str += self.current_char()
+        self.advance()  # skip opening quote
+        chars: list[str] = []
+        while self.current_char() is not None:
+            ch = self.current_char()
+            if ch == "'":
+                if self.peek() == "'":
+                    chars.append("'")
+                    self.advance()
+                    self.advance()
+                    continue
+                self.advance()  # skip closing quote
+                return Token(TokenType.STRING, ''.join(chars), start_line, start_col)
+            chars.append(ch)
             self.advance()
-        if self.current_char() == "'":
-            self.advance()
-        return Token(TokenType.STRING, string_str, self.line, start_col)
+        raise SqlSyntaxError(f'Unterminated string literal at line {start_line} column {start_col}')
 
     def read_identifier_or_keyword(self) -> Token:
         start_col = self.column
@@ -205,6 +240,36 @@ class Lexer:
                 token_type = TokenType.TABLES
             case 'DESCRIBE':
                 token_type = TokenType.DESCRIBE
+            case 'LEFT':
+                token_type = TokenType.LEFT
+            case 'RIGHT':
+                token_type = TokenType.RIGHT
+            case 'INNER':
+                token_type = TokenType.INNER
+            case 'FULL':
+                token_type = TokenType.FULL
+            case 'OUTER':
+                token_type = TokenType.OUTER
+            case 'CROSS':
+                token_type = TokenType.CROSS
+            case 'NATURAL':
+                token_type = TokenType.NATURAL
+            case 'JOIN':
+                token_type = TokenType.JOIN
+            case 'ON':
+                token_type = TokenType.ON
+            case 'USING':
+                token_type = TokenType.USING
+            case 'IN':
+                token_type = TokenType.IN
+            case 'EXISTS':
+                token_type = TokenType.EXISTS
+            case 'ANY':
+                token_type = TokenType.ANY
+            case 'ALL':
+                token_type = TokenType.ALL
+            case 'UNION':
+                token_type = TokenType.UNION
             case 'FROM':
                 token_type = TokenType.FROM
             case 'WHERE':
@@ -224,10 +289,10 @@ class Lexer:
             case 'NULL':
                 token_type = TokenType.NULL
             case 'STRING' | 'VARCHAR':
-                token_type = TokenType.STRING
+                token_type = TokenType.TYPE_STRING
                 identifier = 'STRING'
             case 'NUMBER' | 'DECIMAL' | 'INT':
-                token_type = TokenType.NUMBER
+                token_type = TokenType.TYPE_NUMBER
                 identifier = 'NUMBER'
             case _:
                 token_type = TokenType.IDENTIFIER
@@ -255,6 +320,18 @@ class Lexer:
             case '*':
                 self.advance()
                 return Token(TokenType.STAR, '*', self.line, self.column - 1)
+            case '+':
+                self.advance()
+                return Token(TokenType.PLUS, '+', self.line, self.column - 1)
+            case '-':
+                self.advance()
+                return Token(TokenType.MINUS, '-', self.line, self.column - 1)
+            case '/':
+                self.advance()
+                return Token(TokenType.DIV, '/', self.line, self.column - 1)
+            case '.':
+                self.advance()
+                return Token(TokenType.DOT, '.', self.line, self.column - 1)
             case '=':
                 self.advance()
                 return Token(TokenType.EQ, '=', self.line, self.column - 1)
@@ -280,6 +357,13 @@ class Lexer:
                 else:  # >
                     self.advance()
                     return Token(TokenType.GT, '>', self.line, self.column - 1)
+            case '!':
+                if self.peek() == '=':
+                    start_col = self.column
+                    self.advance()
+                    self.advance()
+                    return Token(TokenType.NE, '!=', self.line, start_col)
+                raise SqlSyntaxError(f'Unexpected character {ch} at line {self.line} column {self.column}')
             case _:
                 if ch.isdigit():
                     return self.read_number()
